@@ -116,7 +116,7 @@ h1 {
 
 .layout-grid {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) 352px;
+  grid-template-columns: minmax(0, 1fr);
   gap: 56px;
   align-items: start;
 }
@@ -850,15 +850,66 @@ h1 {
 
 /* ── Probability distribution chart ─────────────────────────────────────── */
 
-.dist-chart-wrap {
+.dist-rows-wrap {
   margin-bottom: 24px;
 }
 
-.dist-chart-svg {
-  display: block;
+.dist-rows-table {
   width: 100%;
-  height: auto;
-  overflow: visible;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.dist-rows-table th {
+  text-align: left;
+  padding: 6px 10px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #8a857c;
+  border-bottom: 1px solid #dedbd3;
+}
+
+.dist-rows-table td {
+  padding: 7px 10px;
+  border-bottom: 1px solid #ebe8e1;
+  color: #6f6a63;
+  font-variant-numeric: tabular-nums;
+}
+
+.dist-row-label {
+  font-weight: 600;
+  color: #111;
+  white-space: nowrap;
+}
+
+.dist-row-pct {
+  font-weight: 700;
+  color: #111;
+}
+
+.dist-row-bar {
+  width: 38%;
+}
+
+.dist-row-bar span {
+  display: block;
+  height: 8px;
+  border-radius: 4px;
+  background: #b8ddd5;
+}
+
+.dist-row--mid .dist-row-bar span {
+  background: #4db896;
+}
+
+.dist-row--high .dist-row-bar span {
+  background: #13936a;
+}
+
+.dist-row--high .dist-row-pct {
+  color: #0d7a58;
 }
 
 .dist-legend {
@@ -879,17 +930,6 @@ h1 {
 .dist-stat strong {
   color: #111;
   font-weight: 700;
-}
-
-.dist-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 2px;
-  flex-shrink: 0;
-}
-
-.dist-dot--mode {
-  background: #13936a;
 }
 
 /* EV analysis table */

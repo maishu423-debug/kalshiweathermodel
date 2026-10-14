@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -39,39 +39,6 @@ type ApiPayload = {
   };
 };
 
-type PaperPosition = {
-  market_ticker: string;
-  market_label:  string;
-  side:          "yes" | "no";
-  contracts:     number;
-  avg_price_cents: number;
-  cost_basis_cents: number;
-};
-
-type PaperTrade = {
-  id: number;
-  market_ticker: string;
-  market_label:  string;
-  action:        "buy" | "sell";
-  side:          "yes" | "no";
-  price_cents:   number;
-  contracts:     number;
-  cash_delta_cents: number;
-  realized_pl_cents: number | null;
-  created_at:    string;
-};
-
-type PaperState = {
-  account:   {
-    cash_cents: number;
-    starting_cash_cents: number;
-    total_profit_cents: number;
-    total_loss_cents: number;
-  };
-  positions: PaperPosition[];
-  trades:    PaperTrade[];
-};
-
 type ModelResult = {
   error?:      string;
   T0?:         number;
@@ -103,36 +70,10 @@ type MarketMomentum = {
   rank:          number;
 };
 
-type TradeLeg = {
-  ticker:      string;
-  label:       string;
-  side:        "yes" | "no";
-  price_cents: number | null;
-  model_prob:  number;
-};
-
-type Recommendation = {
-  status:    "ready" | "waiting";
-  reason:    string;
-  no_trades: TradeLeg[];
-};
-
 type ForecastHistoryRow = {
   timestamp:         string;
   current_temp_f:    number | null;
   model_forecast_f:  number | null;
-};
-
-type TradeHistoryRow = {
-  timestamp:          string;
-  market_ticker:      string | null;
-  market_label:       string | null;
-  action:             "buy" | "sell" | null;
-  side:               "yes" | "no" | null;
-  price_cents:        number | null;
-  contracts:          number | null;
-  cash_delta_cents:   number | null;
-  realized_pl_cents:  number | null;
 };
 
 type AlgorithmState = {
@@ -144,7 +85,6 @@ type AlgorithmState = {
   };
   temp:           { current_f: number | null; daily_high_f: number | null };
   analysis:       MarketMomentum[];
-  recommendation: Recommendation;
   time_to_cutoff: { hours: number; display: string };
   models_ready:   boolean;
 };
@@ -176,25 +116,6 @@ function pct(value: number | null | undefined) {
   return `${(value * 100).toFixed(1)}%`;
 }
 
-function dollars(value: number | null | undefined) {
-  if (value === null || value === undefined) return "$0.00";
-  return `$${(value / 100).toFixed(2)}`;
-}
-
-function inputDollarsToCents(value: string) {
-  const parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed <= 0) return 0;
-  return Math.round(parsed * 100);
-}
-
-function evColor(ev: number | null | undefined) {
-  if (ev === null || ev === undefined) return "";
-  if (ev >= 0.10) return "ev-strong";
-  if (ev >= 0.05) return "ev-good";
-  if (ev >= 0)    return "ev-weak";
-  return "ev-neg";
-}
-
 function modelLabel(key: string) {
   const map: Record<string, string> = {
     accuweather_1h: "AccuWeather +1h",
@@ -209,111 +130,67 @@ function modelLabel(key: string) {
 
 // ── Probability Distribution Chart ───────────────────────────────────────────
 
-function ProbDistChart({
+function ProbDistRows({
   dist,
   ensemble,
-  brackets,
 }: {
   dist: Array<{ temp: number; prob: number }>;
   ensemble: { mean?: number; mode?: number; p10?: number; p90?: number };
-  brackets: MarketMomentum[];
 }) {
   if (!dist || dist.length === 0) return null;
 
-  const W = 680, H = 130;
-  const ml = 34, mr = 12, mt = 22, mb = 28;
-  const cw = W - ml - mr;
-  const ch = H - mt - mb;
-  const n = dist.length;
-  const gap = cw / n;
-  const barW = Math.max(gap * 0.72, 3);
-  const maxProb = Math.max(...dist.map((d) => d.prob));
+  const total = dist.reduce((sum, d) => sum + d.prob, 0) || 1;
+  const probAt = new Map(dist.map((d) => [d.temp, d.prob / total]));
+  const lo = Math.min(...dist.map((d) => d.temp));
+  const hi = Math.max(...dist.map((d) => d.temp));
 
-  const bracketColor = (temp: number): string => {
-    const b = brackets.find(
-      (br) =>
-        !br.is_dead &&
-        (br.floor == null || temp >= br.floor) &&
-        (br.cap == null || temp < br.cap)
-    );
-    if (!b || b.model_prob == null) return "#c8c4bc";
-    if (b.model_prob >= 0.15) return "#4db896";
-    if (b.model_prob >= 0.05) return "#8dd3be";
-    return "#b8ddd5";
-  };
+  // 2°F brackets aligned like Kalshi's (88–89, 90–91, ...)
+  const rows: Array<{ from: number; to: number; prob: number; atLeast: number; atMost: number }> = [];
+  let cumulative = 0;
+  for (let from = lo - (((lo % 2) + 2) % 2); from <= hi; from += 2) {
+    const prob = (probAt.get(from) ?? 0) + (probAt.get(from + 1) ?? 0);
+    rows.push({ from, to: from + 1, prob, atLeast: 1 - cumulative, atMost: cumulative + prob });
+    cumulative += prob;
+  }
 
-  // x-center of bar for a given temperature (assumes 1°F steps)
-  const xc = (t: number) => ml + (t - dist[0].temp) * gap + gap / 2;
-
-  const meanX = ensemble.mean != null ? xc(ensemble.mean) : null;
-  const p10x  = ensemble.p10 != null ? ml + (ensemble.p10 - dist[0].temp) * gap : null;
-  const p90x  = ensemble.p90 != null ? ml + (ensemble.p90 - dist[0].temp + 1) * gap : null;
-
-  const stride = Math.max(1, Math.ceil(n / 10));
+  const visible = rows.filter((r) => r.prob >= 0.001);
+  const maxProb = Math.max(...visible.map((r) => r.prob), 0.0001);
+  const tier = (p: number) => (p >= 0.6 ? "high" : p >= 0.3 ? "mid" : "low");
 
   return (
-    <div className="dist-chart-wrap">
+    <div className="dist-rows-wrap">
       <h3 className="algo-section-title">
         Probability Distribution
         <span className="algo-hint-inline"> — ensemble daily high forecast</span>
       </h3>
-      <svg viewBox={`0 0 ${W} ${H}`} className="dist-chart-svg" aria-hidden="true">
-        {/* Axes */}
-        <line x1={ml} y1={mt} x2={ml} y2={mt + ch} stroke="#e0ddd7" strokeWidth={1} />
-        <line x1={ml} y1={mt + ch} x2={W - mr} y2={mt + ch} stroke="#e0ddd7" strokeWidth={1} />
 
-        {/* p10–p90 shading */}
-        {p10x != null && p90x != null && p90x > p10x && (
-          <rect x={p10x} y={mt} width={p90x - p10x} height={ch} fill="#13936a" fillOpacity={0.07} rx={3} />
-        )}
-
-        {/* Bars */}
-        {dist.map((d, i) => {
-          const x  = ml + i * gap + (gap - barW) / 2;
-          const bh = Math.max(1, (d.prob / maxProb) * ch);
-          const y  = mt + ch - bh;
-          const isMode = d.temp === ensemble.mode;
-          const fill   = isMode ? "#13936a" : bracketColor(d.temp);
-          return (
-            <g key={d.temp}>
-              <rect x={x} y={y} width={barW} height={bh} fill={fill} rx={2} />
-              {isMode && (
-                <text x={x + barW / 2} y={y - 4} textAnchor="middle" fontSize={10} fill="#0d7a58" fontWeight="700">
-                  {d.temp}°
-                </text>
-              )}
-            </g>
-          );
-        })}
-
-        {/* Mean line */}
-        {meanX != null && (
-          <>
-            <line x1={meanX} y1={mt} x2={meanX} y2={mt + ch} stroke="#9c9890" strokeDasharray="3 2" strokeWidth={1.2} />
-            <text x={meanX} y={mt - 6} textAnchor="middle" fontSize={9} fill="#9c9890">
-              μ {ensemble.mean?.toFixed(1)}°
-            </text>
-          </>
-        )}
-
-        {/* X-axis labels */}
-        {dist.map((d, i) => {
-          if (i % stride !== 0 && i !== n - 1) return null;
-          return (
-            <text key={`xl-${d.temp}`} x={ml + i * gap + gap / 2} y={H - 6} textAnchor="middle" fontSize={9} fill="#a09b93">
-              {d.temp}°
-            </text>
-          );
-        })}
-
-        {/* Y-axis max label */}
-        <text x={ml - 3} y={mt + 4} textAnchor="end" fontSize={9} fill="#c5c1b8">
-          {(maxProb * 100).toFixed(0)}%
-        </text>
-      </svg>
+      <table className="dist-rows-table">
+        <thead>
+          <tr>
+            <th>Range</th>
+            <th>Probability</th>
+            <th></th>
+            <th>P(≥ low)</th>
+            <th>P(≤ high)</th>
+          </tr>
+        </thead>
+        <tbody>
+          {visible.map((r) => (
+            <tr key={r.from} className={`dist-row dist-row--${tier(r.prob)}`}>
+              <td className="dist-row-label">P({r.from}–{r.to}°F)</td>
+              <td className="dist-row-pct">{(r.prob * 100).toFixed(1)}%</td>
+              <td className="dist-row-bar">
+                <span style={{ width: `${(r.prob / maxProb) * 100}%` }} />
+              </td>
+              <td>{(r.atLeast * 100).toFixed(1)}%</td>
+              <td>{(r.atMost * 100).toFixed(1)}%</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
 
       <div className="dist-legend">
-        <span className="dist-stat"><span className="dist-dot dist-dot--mode" />mode <strong>{ensemble.mode}°F</strong></span>
+        <span className="dist-stat">mode <strong>{ensemble.mode}°F</strong></span>
         <span className="dist-stat">mean <strong>{ensemble.mean?.toFixed(1)}°F</strong></span>
         <span className="dist-stat">80% range <strong>{ensemble.p10}–{ensemble.p90}°F</strong></span>
       </div>
@@ -386,29 +263,16 @@ export default function Home() {
   const [lastUpdated, setLastUpdated]           = useState<Date | null>(null);
   const [streamStatus, setStreamStatus] = useState<string>("Connecting…");
   const streamLiveRef = useRef(false);
-  const [paperState, setPaperState]             = useState<PaperState | null>(null);
-  const [tradeMode, setTradeMode]               = useState<"buy" | "sell">("buy");
-  const [contractSide, setContractSide]         = useState<"yes" | "no">("yes");
-  const [dollarAmount, setDollarAmount]         = useState("10");
-  const [orderMessage, setOrderMessage]         = useState<string | null>(null);
-  const [paperError, setPaperError]             = useState<string | null>(null);
-  const [isSubmittingOrder, setIsSubmittingOrder] = useState(false);
 
   // Algorithm state
   const [algoState, setAlgoState]               = useState<AlgorithmState | null>(null);
   const [algoError, setAlgoError]               = useState<string | null>(null);
-  const [algoTradeAmount, setAlgoTradeAmount]   = useState("10");
-  const [isRunningAlgo, setIsRunningAlgo]       = useState(false);
   const [algoMessage, setAlgoMessage]           = useState<string | null>(null);
   const [isRefreshingForecast, setIsRefreshingForecast] = useState(false);
   const [isRefreshingTemp, setIsRefreshingTemp]         = useState(false);
-  const [autoTradeEnabled, setAutoTradeEnabled] = useState(false);
   const [isDistSidebarOpen, setIsDistSidebarOpen] = useState(false);
   const [forecastHistory, setForecastHistory]   = useState<ForecastHistoryRow[]>([]);
-  const [tradeHistory, setTradeHistory]         = useState<TradeHistoryRow[]>([]);
   const lastHistoryForecastRunAtRef = useRef<string | null>(null);
-  const autoTradeRef = useRef(autoTradeEnabled);
-  autoTradeRef.current = autoTradeEnabled;
 
   // Model enable/disable switches
   const ALL_MODELS = ["accuweather_1h", "accuweather_2h", "accuweather_3h", "var_1h", "var_2h", "var_3h"] as const;
@@ -457,9 +321,6 @@ export default function Home() {
     const timer = window.setInterval(load, 2000);
     return () => { ignore = true; window.clearInterval(timer); };
   }, [selectedTicker]);
-
-  // ── Paper state init ───────────────────────────────────────────────────
-  useEffect(() => { loadPaperState(); }, []);
 
   // ── WebSocket → SSE stream ────────────────────────────────────────────
   useEffect(() => {
@@ -615,22 +476,6 @@ export default function Home() {
     loadForecastHistory();
   }, [loadForecastHistory]);
 
-  // ── Trade history — reload after mount and after any trade is placed ──
-  const loadTradeHistory = useCallback(async () => {
-    try {
-      const res = await fetch("/api/kalshi/algorithm/trade-history?limit=100", { cache: "no-store" });
-      if (!res.ok) return;
-      const data = await res.json();
-      setTradeHistory((data.history ?? []) as TradeHistoryRow[]);
-    } catch {
-      // silent — history panel just stays stale until the next successful poll
-    }
-  }, []);
-
-  useEffect(() => {
-    loadTradeHistory();
-  }, [loadTradeHistory]);
-
   useEffect(() => {
     const lastRunAt = algoState?.forecast?.last_run_at ?? null;
     if (!lastRunAt || lastHistoryForecastRunAtRef.current === lastRunAt) return;
@@ -638,158 +483,12 @@ export default function Home() {
     loadForecastHistory();
   }, [algoState?.forecast?.last_run_at, loadForecastHistory]);
 
-  // ── Auto-trade loop (60 s) ─────────────────────────────────────────────
-  useEffect(() => {
-    const timer = window.setInterval(() => {
-      if (autoTradeRef.current) runAlgoTrade();
-    }, 60_000);
-    return () => window.clearInterval(timer);
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Derived values ─────────────────────────────────────────────────────
-  const selectedMarket = useMemo(() => {
-    if (!payload) return null;
-    return payload.markets.find((m) => m.ticker === selectedTicker) ?? payload.selected_market;
-  }, [payload, selectedTicker]);
-
-  const selectedPosition = useMemo(() => {
-    if (!paperState || !selectedMarket) return null;
-    return paperState.positions.find(
-      (p) => p.market_ticker === selectedMarket.ticker && p.side === contractSide
-    ) ?? null;
-  }, [paperState, selectedMarket, contractSide]);
-
-  const tradePrice = useMemo(() => {
-    if (!selectedMarket) return null;
-    if (tradeMode === "buy")
-      return contractSide === "yes" ? selectedMarket.yes_ask_cents : selectedMarket.no_ask_cents;
-    return contractSide === "yes" ? selectedMarket.yes_bid_cents : selectedMarket.no_bid_cents;
-  }, [selectedMarket, tradeMode, contractSide]);
-
-  const tradeDollarsCents  = inputDollarsToCents(dollarAmount);
-  const estimatedContracts = tradePrice && tradeDollarsCents > 0 ? tradeDollarsCents / tradePrice : 0;
-  const maxPayoutCents     = Math.round(estimatedContracts * 100);
-  const canSubmitOrder     = Boolean(selectedMarket && tradePrice && tradeDollarsCents > 0) && !isSubmittingOrder;
-
-  // ── P&L calculations ──────────────────────────────────────────────────
-  const positionMtmCents = useMemo(() => {
-    if (!paperState || !payload) return 0;
-    return paperState.positions.reduce((sum, pos) => {
-      const mkt = payload.markets.find((m) => m.ticker === pos.market_ticker);
-      const bid = pos.side === "yes" ? mkt?.yes_bid_cents : mkt?.no_bid_cents;
-      return sum + (bid != null ? pos.contracts * bid : pos.cost_basis_cents);
-    }, 0);
-  }, [paperState, payload]);
-
-  const totalPLCents = useMemo(() => {
-    if (!paperState) return 0;
-    return (
-      paperState.account.cash_cents +
-      positionMtmCents -
-      paperState.account.starting_cash_cents
-    );
-  }, [paperState, positionMtmCents]);
-
   // ── Handlers ──────────────────────────────────────────────────────────
   function selectMarket(ticker: string) {
     setSelectedTicker(ticker);
     const url = new URL(window.location.href);
     url.searchParams.set("market_ticker", ticker);
     window.history.replaceState({}, "", url);
-    setOrderMessage(null);
-  }
-
-  async function loadPaperState() {
-    try {
-      const res = await fetch("/api/kalshi/paper/state", { cache: "no-store" });
-      if (!res.ok) throw new Error(`Paper API returned ${res.status}`);
-      setPaperState((await res.json()) as PaperState);
-      setPaperError(null);
-    } catch (err) {
-      setPaperError(err instanceof Error ? err.message : "Paper trading API is unavailable.");
-    }
-  }
-
-  async function placePaperOrder() {
-    if (!selectedMarket || !tradePrice) return;
-    setIsSubmittingOrder(true);
-    setOrderMessage(null);
-    try {
-      const res = await fetch("/api/kalshi/paper/order", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          action: tradeMode, side: contractSide,
-          market_ticker: selectedMarket.ticker, market_label: selectedMarket.label,
-          price_cents: tradePrice, dollars_cents: tradeDollarsCents,
-        }),
-      });
-      const text = await res.text();
-      const data = text ? JSON.parse(text) : {};
-      if (!res.ok) throw new Error(data.error || "Order failed.");
-      setPaperState(data.state as PaperState);
-      setPaperError(null);
-      setOrderMessage(
-        `${tradeMode === "buy" ? "Bought" : "Sold"} ${data.trade.contracts.toFixed(4)} ${contractSide.toUpperCase()} at ${data.trade.price_cents}c`
-      );
-      loadTradeHistory();
-    } catch (err) {
-      setOrderMessage(err instanceof Error ? err.message : "Order failed.");
-    } finally {
-      setIsSubmittingOrder(false);
-    }
-  }
-
-  async function resetPaperAccount() {
-    try {
-      const res = await fetch("/api/kalshi/paper/reset", { method: "POST" });
-      if (!res.ok) throw new Error(`Paper API returned ${res.status}`);
-      setPaperState((await res.json()) as PaperState);
-      setPaperError(null);
-      setOrderMessage("Paper account reset.");
-    } catch (err) {
-      setPaperError(err instanceof Error ? err.message : "Paper trading API is unavailable.");
-    }
-  }
-
-  async function runAlgoTrade() {
-    setIsRunningAlgo(true);
-    setAlgoMessage(null);
-
-    try {
-      const active = Object.entries(enabledModelsRef.current)
-        .filter(([, on]) => on).map(([k]) => k);
-      const res = await fetch("/api/kalshi/algorithm/trade", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          dollars_cents: inputDollarsToCents(algoTradeAmount),
-          enabled_models: active,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Trade failed.");
-
-      if (data.state) setPaperState(data.state as PaperState);
-
-      if (data.message) {
-        setAlgoMessage(data.message);
-      } else if (data.trades?.length) {
-        const parts = (data.trades as Array<{action: string; trade?: {contracts?: number; price_cents?: number}; error?: string}>).map(
-          (t) => t.error
-            ? `${t.action}: failed (${t.error})`
-            : `${t.action} ${t.trade?.contracts?.toFixed(2) ?? "?"} @ ${t.trade?.price_cents}¢`
-        );
-        setAlgoMessage(parts.join("  |  "));
-      }
-
-      loadAlgoState();
-      loadTradeHistory();
-    } catch (err) {
-      setAlgoMessage(err instanceof Error ? err.message : "Algo trade failed.");
-    } finally {
-      setIsRunningAlgo(false);
-    }
   }
 
   async function refreshTemp() {
@@ -830,7 +529,6 @@ export default function Home() {
   if (isLoading) return <main className="shell"><div className="status">Loading Miami market data...</div></main>;
   if (error || !payload) return <main className="shell"><div className="status error">Could not load data: {error}</div></main>;
 
-  const rec         = algoState?.recommendation;
   const timeLeft    = algoState?.time_to_cutoff;
   const ensemble    = algoState?.forecast?.ensemble;
   const modelsReady = algoState?.models_ready ?? false;
@@ -916,45 +614,13 @@ export default function Home() {
             >
               Distributions
             </button>
-
-            <label className="algo-auto-toggle">
-              <input
-                type="checkbox"
-                checked={autoTradeEnabled}
-                onChange={(e) => {
-                  setAutoTradeEnabled(e.target.checked);
-                  setAlgoMessage(e.target.checked ? "Auto-trade ON — executes paper trades every 60s." : "Auto-trade OFF.");
-                }}
-              />
-              Auto-trade
-            </label>
-
-            <label className="algo-amount-label">
-              $<input
-                type="number"
-                className="algo-amount-input"
-                min="1"
-                step="1"
-                value={algoTradeAmount}
-                onChange={(e) => setAlgoTradeAmount(e.target.value)}
-              />
-              per trade
-            </label>
-
-            <button
-              className="algo-btn algo-btn--trade"
-              onClick={() => runAlgoTrade()}
-              disabled={isRunningAlgo}
-            >
-              {isRunningAlgo ? "Running…" : "Run Cycle"}
-            </button>
           </div>
         </div>
 
         {algoMessage && <p className="algo-message">{algoMessage}</p>}
         {algoError   && <p className="algo-error">{algoError}</p>}
 
-        {/* Models + Recommendation row */}
+        {/* Models row */}
         <div className="algo-body">
           {/* Model forecast cards */}
           <div className="algo-models">
@@ -1034,53 +700,11 @@ export default function Home() {
               </p>
             )}
           </div>
-
-          {/* Recommendation */}
-          {rec && (
-            <div className="algo-rec-wrap">
-              <h3 className="algo-section-title">Recommendation</h3>
-              {rec.status === "waiting" ? (
-                <div className="algo-rec algo-rec--wait">
-                  <div className="rec-action">WAIT</div>
-                  <p className="rec-reason">{rec.reason}</p>
-                </div>
-              ) : (
-                <div className="algo-rec-grid">
-                  {/* NO ladder — current bracket (if close enough to cap) + every bracket below it */}
-                  {(rec.no_trades ?? []).map((trade) => (
-                    <div className="algo-rec algo-rec--no" key={trade.ticker}>
-                      <div className="rec-action">BUY NO</div>
-                      <div className="rec-label">{trade.label}</div>
-                      <div className="rec-details">
-                        <div className="rec-row">
-                          <span>Ask price</span>
-                          <strong>{cents(trade.price_cents)}</strong>
-                        </div>
-                        <div className="rec-row">
-                          <span>YES prob (low)</span>
-                          <strong className="ev-neg">{(trade.model_prob * 100).toFixed(1)}%</strong>
-                        </div>
-                        <div className="rec-row">
-                          <span>NO wins if</span>
-                          <strong>{((1 - trade.model_prob) * 100).toFixed(1)}%</strong>
-                        </div>
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-              {rec.reason && <p className="rec-reason rec-reason--sub">{rec.reason}</p>}
-            </div>
-          )}
         </div>
 
         {/* Probability distribution */}
         {ensemble?.dist && ensemble.dist.length > 0 && (
-          <ProbDistChart
-            dist={ensemble.dist}
-            ensemble={ensemble}
-            brackets={algoState?.analysis ?? []}
-          />
+          <ProbDistRows dist={ensemble.dist} ensemble={ensemble} />
         )}
 
         {/* Momentum table */}
@@ -1163,51 +787,9 @@ export default function Home() {
           </div>
         )}
       </aside>
-
-      {/* ── Trade history: every paper trade placed, persisted to Google Sheets ── */}
-      <aside className="forecast-history-panel">
-        <h3 className="algo-section-title">
-          Trade History
-          <span className="algo-hint-inline"> — every buy/sell, saved to Sheets</span>
-        </h3>
-        {tradeHistory.length === 0 ? (
-          <p className="algo-hint">No trades yet — history lands here right after the next order.</p>
-        ) : (
-          <div className="forecast-history-scroll">
-            <table className="forecast-history-table">
-              <thead>
-                <tr>
-                  <th>Time</th>
-                  <th>Market</th>
-                  <th>Action</th>
-                  <th>Price</th>
-                  <th>Contracts</th>
-                  <th>Cash</th>
-                  <th>P/L</th>
-                </tr>
-              </thead>
-              <tbody>
-                {tradeHistory.map((row, i) => (
-                  <tr key={`${row.timestamp}-${i}`}>
-                    <td>{row.timestamp ? new Date(row.timestamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : "—"}</td>
-                    <td>{row.market_label || row.market_ticker || "—"}</td>
-                    <td>{row.action && row.side ? `${row.action} ${row.side.toUpperCase()}` : "—"}</td>
-                    <td>{cents(row.price_cents)}</td>
-                    <td>{row.contracts != null ? row.contracts.toFixed(2) : "—"}</td>
-                    <td>{row.cash_delta_cents != null ? dollars(row.cash_delta_cents) : "—"}</td>
-                    <td className={row.realized_pl_cents != null ? (row.realized_pl_cents >= 0 ? "dir-ok" : "ev-neg") : ""}>
-                      {row.realized_pl_cents != null ? dollars(row.realized_pl_cents) : "—"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </aside>
       </div>
 
-      {/* ── Market list + trade card ── */}
+      {/* ── Market list ── */}
       <section className="layout-grid">
         <div>
           <div className="market-table">
@@ -1245,173 +827,7 @@ export default function Home() {
             <strong>{payload.series.important_info.title || "Important information:"}</strong>
             <span>{payload.series.important_info.message}</span>
           </div>
-
-          {/* ── Portfolio & Trade History ── */}
-          <section className="pnl-section">
-            <h2 className="pnl-title">Portfolio</h2>
-
-            {/* Summary cards */}
-            <div className="pnl-summary">
-              <div className="pnl-card">
-                <span className="pnl-label">Cash</span>
-                <strong>{dollars(paperState?.account.cash_cents)}</strong>
-              </div>
-              <div className="pnl-card">
-                <span className="pnl-label">Open Value</span>
-                <strong>{dollars(Math.round(positionMtmCents))}</strong>
-              </div>
-              <div className={`pnl-card ${totalPLCents >= 0 ? "pnl-card--pos" : "pnl-card--neg"}`}>
-                <span className="pnl-label">Net P&amp;L</span>
-                <strong>{totalPLCents >= 0 ? "+" : ""}{dollars(Math.round(totalPLCents))}</strong>
-              </div>
-              <div className="pnl-card pnl-card--profit">
-                <span className="pnl-label">Total Profit</span>
-                <strong>+{dollars(paperState?.account.total_profit_cents ?? 0)}</strong>
-              </div>
-              <div className="pnl-card pnl-card--loss">
-                <span className="pnl-label">Total Loss</span>
-                <strong>{dollars(paperState?.account.total_loss_cents ?? 0)}</strong>
-              </div>
-            </div>
-
-            {/* Open positions with per-position P&L */}
-            {(paperState?.positions?.length ?? 0) > 0 && (
-              <div className="pnl-open">
-                <h3 className="pnl-subtitle">Open Positions</h3>
-                {paperState!.positions.map((pos) => {
-                  const mkt = payload.markets.find((m) => m.ticker === pos.market_ticker);
-                  const bid = pos.side === "yes" ? mkt?.yes_bid_cents : mkt?.no_bid_cents;
-                  const mtm = bid != null ? pos.contracts * bid : pos.cost_basis_cents;
-                  const posPL = mtm - pos.cost_basis_cents;
-                  return (
-                    <div className="pnl-pos-row" key={`${pos.market_ticker}-${pos.side}`}>
-                      <span className="pnl-pos-name">
-                        {pos.market_label}
-                        <span className={`ev-badge ${pos.side}`}>{pos.side.toUpperCase()}</span>
-                      </span>
-                      <span className="pnl-pos-detail">
-                        {pos.contracts.toFixed(2)} contracts @ {pos.avg_price_cents.toFixed(0)}¢
-                      </span>
-                      <span className={`pnl-pos-pl ${posPL >= 0 ? "pnl-up" : "pnl-dn"}`}>
-                        {posPL >= 0 ? "+" : ""}{dollars(Math.round(posPL))}
-                      </span>
-                    </div>
-                  );
-                })}
-              </div>
-            )}
-
-            {/* Trade history */}
-            <h3 className="pnl-subtitle">Recent Trades</h3>
-            {(paperState?.trades?.length ?? 0) > 0 ? (
-              <div className="pnl-trades">
-                {paperState!.trades.map((t) => (
-                  <div className="pnl-trade-row" key={t.id}>
-                    <span className="pnl-trade-time">{new Date(t.created_at).toLocaleTimeString()}</span>
-                    <span className={`pnl-trade-action ${t.action === "buy" ? "pnl-buy" : "pnl-sell"}`}>
-                      {t.action.toUpperCase()}
-                    </span>
-                    <span className={`ev-badge ${t.side}`}>{t.side.toUpperCase()}</span>
-                    <span className="pnl-trade-market">{t.market_label}</span>
-                    <span className="pnl-trade-detail">{t.contracts.toFixed(2)} @ {t.price_cents}¢</span>
-                    {t.action === "sell" && t.realized_pl_cents != null ? (
-                      <span className={`pnl-trade-delta ${t.realized_pl_cents >= 0 ? "pnl-up" : "pnl-dn"}`}>
-                        {t.realized_pl_cents >= 0 ? "+" : ""}{dollars(t.realized_pl_cents)}
-                      </span>
-                    ) : (
-                      <span className="pnl-trade-delta pnl-trade-cost">
-                        {dollars(t.cash_delta_cents)}
-                      </span>
-                    )}
-                  </div>
-                ))}
-              </div>
-            ) : (
-              <p className="pnl-empty">No trades yet — run a cycle or use the trade card.</p>
-            )}
-          </section>
         </div>
-
-        {/* Trade card */}
-        <aside className="trade-card">
-          <div className="tabs">
-            <button className={tradeMode === "buy" ? "tab-active" : ""} onClick={() => setTradeMode("buy")}>Buy</button>
-            <button className={tradeMode === "sell" ? "tab-active" : ""} onClick={() => setTradeMode("sell")}>Sell</button>
-          </div>
-          <p className="question">{payload.event.title}</p>
-          <div className="selected-contract">
-            <div className="mini-badge">MIA</div>
-            <h2>{selectedMarket?.label}</h2>
-          </div>
-          <div className="side-toggle">
-            <button className={contractSide === "yes" ? "active" : ""} onClick={() => setContractSide("yes")}>
-              YES {cents(tradeMode === "buy" ? selectedMarket?.yes_ask_cents : selectedMarket?.yes_bid_cents)}
-            </button>
-            <button className={contractSide === "no" ? "active" : ""} onClick={() => setContractSide("no")}>
-              NO {cents(tradeMode === "buy" ? selectedMarket?.no_ask_cents : selectedMarket?.no_bid_cents)}
-            </button>
-          </div>
-          <label className="dollars-input editable">
-            <span>Dollars</span>
-            <input min="0" step="1" type="number" value={dollarAmount} onChange={(e) => setDollarAmount(e.target.value)} />
-          </label>
-          <div className="trade-meta">
-            <span>Paper cash</span>
-            <strong>{dollars(paperState?.account.cash_cents)}</strong>
-          </div>
-          {paperError ? <p className="paper-error">Paper trading unavailable: {paperError}</p> : null}
-          <div className="trade-meta">
-            <span>Estimated contracts</span>
-            <strong>{estimatedContracts.toFixed(4)}</strong>
-          </div>
-          <div className="trade-meta">
-            <span>{tradeMode === "buy" ? "Max payout" : "Position"}</span>
-            <strong>
-              {tradeMode === "buy"
-                ? dollars(maxPayoutCents)
-                : `${(selectedPosition?.contracts ?? 0).toFixed(4)} contracts`}
-            </strong>
-          </div>
-          <button className="signup-button" disabled={!canSubmitOrder} onClick={placePaperOrder}>
-            {isSubmittingOrder
-              ? "Placing..."
-              : `${tradeMode === "buy" ? "Buy" : "Sell"} ${contractSide.toUpperCase()} paper trade`}
-          </button>
-          {orderMessage ? <p className="order-message">{orderMessage}</p> : null}
-          <button className="reset-button" onClick={resetPaperAccount}>Reset paper account</button>
-
-          <div className="orderbook">
-            <h3>Top Orderbook</h3>
-            <div className="book-grid">
-              <div>
-                <strong>YES bids</strong>
-                {payload.orderbook.yes.slice().reverse().map((level) => (
-                  <span key={`yes-${level.price_cents}`}>{cents(level.price_cents)} · {level.count}</span>
-                ))}
-              </div>
-              <div>
-                <strong>NO bids</strong>
-                {payload.orderbook.no.slice().reverse().map((level) => (
-                  <span key={`no-${level.price_cents}`}>{cents(level.price_cents)} · {level.count}</span>
-                ))}
-              </div>
-            </div>
-          </div>
-
-          <div className="positions">
-            <h3>Paper Positions</h3>
-            {paperState?.positions.length ? (
-              paperState.positions.map((position) => (
-                <div className="position-row" key={`${position.market_ticker}-${position.side}`}>
-                  <span>{position.market_label} {position.side.toUpperCase()}</span>
-                  <strong>{position.contracts.toFixed(4)} @ {position.avg_price_cents.toFixed(1)}c</strong>
-                </div>
-              ))
-            ) : (
-              <p>No paper positions yet.</p>
-            )}
-          </div>
-        </aside>
       </section>
 
       {isDistSidebarOpen && (
