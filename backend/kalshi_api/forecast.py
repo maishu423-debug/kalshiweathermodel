@@ -3,6 +3,11 @@ Background forecast runner.
 
 Spawns all 6 ML model scripts as subprocesses in parallel every FORECAST_REFRESH_SECONDS (default 5 minutes),
 caches their JSON output in memory, and exposes helpers for the algorithm.
+
+The only live weather source is NOAA MADIS HFMETAR.  When it is unavailable the
+runner does not run the models and does not fall back to anything else: it keeps
+the last forecast, reports "waiting for HFMETAR", and retries every
+HFMETAR_RETRY_SECONDS until observations are available again.
 """
 import json
 import os
@@ -28,6 +33,7 @@ MODELS = [
 ]
 
 REFRESH_INTERVAL = int(os.getenv("FORECAST_REFRESH_SECONDS", "300"))  # seconds (default 5 minutes)
+HFMETAR_RETRY_SECONDS = int(os.getenv("HFMETAR_RETRY_SECONDS", "30"))  # retry cadence while waiting for HFMETAR
 STARTUP_DELAY = 30      # let lightweight /ping/ respond before CPU-heavy models start
 
 _lock = threading.Lock()
@@ -39,6 +45,7 @@ _loop = {
     "last_cycle_finished_at": None,
     "next_run_at": None,
     "last_error": None,
+    "waiting_for_hfmetar": None,   # {"reason": str, "since": iso} while HFMETAR is unavailable
 }
 _cache = {
     "results":      {},     # model_name -> dict (or {"error": ...})
@@ -79,6 +86,23 @@ def _cached_model_high_f():
     return max(highs) if highs else None
 
 
+def _wind_block(speed, direction, imperial):
+    """
+    AccuWeather-shaped wind dict that OMITS unknown values.  The model scripts
+    default a missing key to NaN, but float(None) raises, and a calm METAR
+    (0 mph) has no wind direction.
+    """
+    spd = {"Value": speed}
+    if imperial:
+        spd = {"Imperial": spd}
+    block = {}
+    if speed is not None:
+        block["Speed"] = spd
+    if direction is not None:
+        block["Direction"] = {"Degrees": direction}
+    return block
+
+
 def _fetch_hfmetar_shared():
     """
     One NOAA MADIS HFMETAR fetch per cycle, shared across all model subprocesses.
@@ -111,8 +135,7 @@ def _fetch_hfmetar_shared():
         "Temperature": {"Imperial": {"Value": float(cur["temp_f"])}},
         "CloudCover": None if cur.get("cloud_fraction") is None else float(cur["cloud_fraction"]) * 100.0,
         "RelativeHumidity": None if cur.get("relative_humidity") is None else float(cur["relative_humidity"]) * 100.0,
-        "Wind": {"Speed": {"Imperial": {"Value": _num(cur.get("wind_speed_mph"))}},
-                 "Direction": {"Degrees": _num(cur.get("wind_dir_deg"))}},
+        "Wind": _wind_block(_num(cur.get("wind_speed_mph")), _num(cur.get("wind_dir_deg")), imperial=True),
         "Pressure": {"Imperial": {"Value": None if pressure_hpa is None else pressure_hpa / 33.8639}},
         "UVIndex": 0.0,
     }
@@ -128,8 +151,7 @@ def _fetch_hfmetar_shared():
             "Temperature": {"Value": float(cur["temp_f"])},
             "CloudCover": None if cc is None else cc * 100.0,
             "RelativeHumidity": {"Value": None if rh is None else rh * 100.0},
-            "Wind": {"Speed": {"Value": row.get("wind_speed_mph")},
-                     "Direction": {"Degrees": row.get("wind_dir_deg")}},
+            "Wind": _wind_block(row.get("wind_speed_mph"), row.get("wind_dir_deg"), imperial=False),
         })
 
     return {
@@ -173,9 +195,13 @@ def _run_one_model(model, aw_shared_path=None):
 
 
 def _do_refresh():
+    """
+    Run all models once.  Returns True if they ran, False if HFMETAR is unavailable
+    (nothing ran; the caller should retry soon), None if a refresh was already running.
+    """
     with _lock:
         if _cache["running"]:
-            return
+            return None
         _cache["running"] = True
 
     # Fetch NOAA MADIS HFMETAR once and share it across all model subprocesses.
@@ -197,17 +223,32 @@ def _do_refresh():
         unavailable = f"weather_unavailable: HFMETAR fetch failed ({exc})"
         print(f"[forecast] {unavailable}")
 
+    if unavailable:
+        # No fallback provider: keep the last forecast, flag the wait, and let the caller retry soon.
+        with _lock:
+            waiting = _loop["waiting_for_hfmetar"]
+            first_time = waiting is None
+            _loop["waiting_for_hfmetar"] = {
+                "reason": unavailable,
+                "since": waiting["since"] if waiting else datetime.utcnow().isoformat(),
+            }
+            _cache["running"] = False
+        if first_time:
+            print(f"[forecast] waiting for HFMETAR — {unavailable}; retrying every {HFMETAR_RETRY_SECONDS}s")
+        return False
+
+    with _lock:
+        if _loop["waiting_for_hfmetar"] is not None:
+            print("[forecast] HFMETAR is back — running models")
+        _loop["waiting_for_hfmetar"] = None
+
     results = {}
     try:
-        if unavailable:
-            # Never let a model script fall back to another provider: report the outage instead.
-            results = {m["name"]: {"error": unavailable} for m in MODELS}
-        else:
-            with ThreadPoolExecutor(max_workers=4) as pool:
-                futures = {pool.submit(_run_one_model, m, aw_shared_path): m for m in MODELS}
-                for future in as_completed(futures):
-                    name, data = future.result()
-                    results[name] = data
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {pool.submit(_run_one_model, m, aw_shared_path): m for m in MODELS}
+            for future in as_completed(futures):
+                name, data = future.result()
+                results[name] = data
     finally:
         if aw_shared_path:
             try:
@@ -221,6 +262,7 @@ def _do_refresh():
             _cache["running"]      = False
 
     _record_forecast_snapshot(results)
+    return True
 
 
 def _record_forecast_snapshot(results: dict):
@@ -258,15 +300,17 @@ def _background_loop():
             _loop["last_cycle_started_at"] = datetime.utcnow().isoformat()
             _loop["next_run_at"] = None
             _loop["last_error"] = None
+        interval = REFRESH_INTERVAL
         try:
-            _do_refresh()
+            if _do_refresh() is False:
+                interval = HFMETAR_RETRY_SECONDS   # HFMETAR unavailable — keep polling for it
         except Exception as exc:
             error = str(exc)
             with _lock:
                 _loop["last_error"] = error
             print(f"[forecast] background refresh crashed ({exc}); will retry in {REFRESH_INTERVAL}s")
         elapsed = time.time() - started_at
-        sleep_for = max(0, REFRESH_INTERVAL - elapsed)
+        sleep_for = max(0, interval - elapsed)
         with _lock:
             _loop["last_cycle_finished_at"] = datetime.utcnow().isoformat()
             _loop["next_run_at"] = datetime.utcfromtimestamp(

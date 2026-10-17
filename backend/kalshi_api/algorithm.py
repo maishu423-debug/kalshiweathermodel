@@ -1,14 +1,13 @@
 """
-Model-driven trading algorithm.
+Model-driven paper-trading strategy.
 
 ENSEMBLE:     Pair same-horizon models (A1+V1, A2+V2, A3+V3) with
               weighted averages, then combine into a daily-high PDF.
-EACH CYCLE:   Find the live bracket containing the ensemble mean forecast
-              ("current bracket"). Buy NO on every live bracket below it
-              ("previous brackets"). Also buy NO on the current bracket
-              itself if the forecast is within NO_LADDER_CAP_MARGIN_F of
-              its cap (i.e. likely to round past this bracket entirely).
-NO AUTO-SELL: Contracts are held until manually closed.
+EACH CYCLE:   Rank the live Kalshi buckets by model probability.
+              Buy YES on the single highest-probability bucket.
+              Buy NO on every live bucket whose model probability is below
+              NO_MAX_MODEL_PROB.
+NO SELLING:   Contracts are held until Kalshi settles the market.
 """
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -20,10 +19,11 @@ from .price_tracker import get_all_velocities, get_temp_snapshot, nws_round_temp
 MIAMI_UTC_OFFSET  = -4
 CUTOFF_LOCAL_HOUR = 16
 
-# If the ensemble-mean forecast is within this many degrees of the current
-# bracket's cap, the forecast is considered likely to round past the cap —
-# so the current bracket also gets a NO trade, not just the brackets below it.
-NO_LADDER_CAP_MARGIN_F = 0.1
+# Buy NO on live buckets the model gives less than this probability, as long as
+# the NO ask is still below NO_MAX_PRICE_CENTS (above that there is no upside).
+NO_MAX_MODEL_PROB = 0.05
+NO_MAX_PRICE_CENTS = 98
+YES_MAX_PRICE_CENTS = 98
 
 # Weighted combination within each horizon pair.
 # AccuWeather and Variable-combined models are paired by forecast horizon.
@@ -249,30 +249,20 @@ def analyze_markets(markets: list) -> list:
 
 # ── Recommendation ────────────────────────────────────────────────────────────
 
-def _bracket_contains(bracket: dict, value: float) -> bool:
-    floor = bracket.get("floor")
-    cap   = bracket.get("cap")
-    return (floor is None or value >= float(floor)) and (cap is None or value < float(cap))
-
-
 def get_recommendation(analyses: list, results=None) -> dict:
     """
-    NO-ladder strategy, run each cycle:
-      1. Locate the live bracket containing the ensemble-mean forecast
-         ("current bracket").
-      2. Buy NO on every live bracket below it ("previous brackets").
-      3. Also buy NO on the current bracket itself if the forecast is
-         within NO_LADDER_CAP_MARGIN_F of its cap — close enough to the
-         top that it's likely to round past this bracket too.
-
-    No YES trades. No auto-sell logic — contracts are held until manually
-    closed.
+    Strategy run each cycle:
+      1. Rank live brackets by model probability.
+      2. YES on the highest-probability bracket.
+      3. NO on every other live bracket with model probability < NO_MAX_MODEL_PROB.
 
     Return shape:
       {
-        "status":    "ready" | "waiting",
-        "reason":    str,
-        "no_trades": [{ticker, label, side, price_cents, model_prob}, ...],
+        "status":     "ready" | "waiting",
+        "reason":     str,
+        "mean":       float | None,   # ensemble mean daily high
+        "yes_trade":  {ticker, label, side, price_cents, model_prob} | None,
+        "no_trades":  [{ticker, label, side, price_cents, model_prob}, ...],
       }
     """
     if results is None:
@@ -285,6 +275,9 @@ def get_recommendation(analyses: list, results=None) -> dict:
     high_pdf     = _compute_daily_high_pdf(horizon_pdfs, known_hi, _get_path_high_pdf(results))
     has_models   = bool(high_pdf)
 
+    def waiting(reason, mean=None):
+        return {"status": "waiting", "reason": reason, "mean": mean, "yes_trade": None, "no_trades": []}
+
     live = [a for a in analyses if not a["is_dead"]]
     for bracket in live:
         bracket["model_prob"] = (
@@ -293,44 +286,21 @@ def get_recommendation(analyses: list, results=None) -> dict:
         )
 
     if not live:
-        return {"status": "waiting", "reason": "All brackets eliminated by daily high.", "no_trades": []}
-
+        return waiting("All brackets eliminated by daily high.")
     if not has_models:
-        return {"status": "waiting", "reason": "Waiting for model forecasts to load.", "no_trades": []}
+        return waiting("Waiting for model forecasts to load.")
 
-    mean_high = sum(t * p for t, p in high_pdf.items())
+    mean_high = round(sum(t * p for t, p in high_pdf.items()), 2)
 
-    sorted_live = sorted(
-        live,
-        key=lambda b: float(b["floor"]) if b.get("floor") is not None else float("-inf"),
-    )
-
-    current_idx = next(
-        (i for i, b in enumerate(sorted_live) if _bracket_contains(b, mean_high)),
-        None,
-    )
-    if current_idx is None:
-        return {
-            "status":    "waiting",
-            "reason":    f"Forecast {mean_high:.1f}°F falls outside all live brackets.",
-            "no_trades": [],
-        }
-
-    current_bracket   = sorted_live[current_idx]
-    previous_brackets = sorted_live[:current_idx]
-
-    cap             = current_bracket.get("cap")
-    include_current = cap is not None and mean_high >= (float(cap) - NO_LADDER_CAP_MARGIN_F)
-
-    ladder = list(previous_brackets)
-    if include_current:
-        ladder.append(current_bracket)
-
-    if not ladder:
-        return {
-            "status":    "waiting",
-            "reason":    f"Forecast {mean_high:.1f}°F sits inside the lowest live bracket ({current_bracket['label']}); nothing to fade.",
-            "no_trades": [],
+    top = max(live, key=lambda b: b["model_prob"] or 0.0)
+    yes_trade = None
+    if top.get("yes_ask_cents") and top["yes_ask_cents"] <= YES_MAX_PRICE_CENTS:
+        yes_trade = {
+            "ticker":      top["ticker"],
+            "label":       top["label"],
+            "side":        "yes",
+            "price_cents": top["yes_ask_cents"],
+            "model_prob":  top["model_prob"] or 0.0,
         }
 
     no_trades = [
@@ -338,21 +308,30 @@ def get_recommendation(analyses: list, results=None) -> dict:
             "ticker":      b["ticker"],
             "label":       b["label"],
             "side":        "no",
-            "price_cents": b.get("no_ask_cents"),
-            "model_prob":  b.get("model_prob") or 0.0,
+            "price_cents": b["no_ask_cents"],
+            "model_prob":  b["model_prob"] or 0.0,
         }
-        for b in ladder
+        for b in live
+        if b["ticker"] != top["ticker"]
+        and (b["model_prob"] or 0.0) < NO_MAX_MODEL_PROB
+        and b.get("no_ask_cents")
+        and b["no_ask_cents"] <= NO_MAX_PRICE_CENTS
     ]
 
-    reason = (
-        f"Forecast {mean_high:.1f}°F → {current_bracket['label']} "
-        f"({'incl.' if include_current else 'excl.'} current bracket) "
-        f"— NO x{len(no_trades)}: " + ", ".join(t["label"] for t in no_trades)
-    )
+    if yes_trade is None and not no_trades:
+        return waiting(f"Top bucket {top['label']} has no tradable price and no NO candidates.", mean_high)
+
+    parts = []
+    if yes_trade:
+        parts.append(f"YES {yes_trade['label']} ({yes_trade['model_prob'] * 100:.0f}%)")
+    if no_trades:
+        parts.append(f"NO x{len(no_trades)}: " + ", ".join(t["label"] for t in no_trades))
 
     return {
         "status":    "ready",
-        "reason":    reason,
+        "reason":    f"Forecast {mean_high:.1f}°F — " + " | ".join(parts),
+        "mean":      mean_high,
+        "yes_trade": yes_trade,
         "no_trades": no_trades,
     }
 

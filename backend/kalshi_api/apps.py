@@ -18,6 +18,7 @@ class KalshiApiConfig(AppConfig):
         if not run_tasks:
             return
 
+        from .autotrader import start_autotrader
         from .forecast import start_background_refresh
         from .price_tracker import start_price_tracking
         from .temp_monitor import start_temp_monitor
@@ -25,3 +26,4 @@ class KalshiApiConfig(AppConfig):
         start_background_refresh()
         start_temp_monitor()
         start_price_tracking()
+        start_autotrader()

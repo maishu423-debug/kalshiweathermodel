@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import PaperTrading, { type Recommendation } from "./PaperTrading";
 
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -82,9 +83,11 @@ type AlgorithmState = {
     ensemble:    { current_temp_f?: number; mean?: number; mode?: number; mode_prob?: number; p10?: number; p90?: number; n_models?: number; dist?: Array<{ temp: number; prob: number }> };
     last_run_at: string | null;
     running:     boolean;
+    loop?:       { waiting_for_hfmetar?: { reason: string; since: string } | null } | null;
   };
   temp:           { current_f: number | null; daily_high_f: number | null };
   analysis:       MarketMomentum[];
+  recommendation: Recommendation;
   time_to_cutoff: { hours: number; display: string };
   models_ready:   boolean;
 };
@@ -628,6 +631,12 @@ export default function Home() {
             {!modelsReady && !algoState?.forecast?.running && (
               <p className="algo-hint">No forecast yet — click <strong>Refresh Forecast</strong> to run all 6 models.</p>
             )}
+            {algoState?.forecast?.loop?.waiting_for_hfmetar && (
+              <p className="algo-running">
+                ⏳ Waiting for HFMETAR since {new Date(algoState.forecast.loop.waiting_for_hfmetar.since + "Z").toLocaleTimeString()} — {algoState.forecast.loop.waiting_for_hfmetar.reason.replace("weather_unavailable: ", "")}.
+                {" "}No other source is used; retrying every 30 s and the models run as soon as it returns.
+              </p>
+            )}
             {algoState?.forecast?.running && (
               <p className="algo-running">⏳ Models running… (~2–3 min). Page polls every 5 s.</p>
             )}
@@ -706,6 +715,9 @@ export default function Home() {
         {ensemble?.dist && ensemble.dist.length > 0 && (
           <ProbDistRows dist={ensemble.dist} ensemble={ensemble} />
         )}
+
+        {/* Paper trading bot */}
+        <PaperTrading books={payload.markets} recommendation={algoState?.recommendation} />
 
         {/* Momentum table */}
         {algoState?.analysis && algoState.analysis.length > 0 && (

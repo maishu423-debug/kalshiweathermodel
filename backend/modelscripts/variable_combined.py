@@ -975,20 +975,20 @@ def run_once_json():
                     wind_dir=float((_p.get("Wind") or {}).get("Direction", {}).get("Degrees", float("nan"))),
                 ))
             df_fore = pd.DataFrame(_fr)
-        except Exception:
-            curr, df_fore = None, None
-    if curr is None:
-        curr = fetch_current()
-    if df_fore is None:
-        df_fore = fetch_forecast()
+        except Exception as exc:
+            # No fallback provider: surface the real error so the backend keeps waiting for HFMETAR.
+            raise RuntimeError(f"HFMETAR shared data unreadable ({type(exc).__name__}: {exc})") from exc
+    if curr is None or df_fore is None:
+        raise RuntimeError("HFMETAR shared data missing (AW_SHARED_DATA not set); no other weather source is used.")
 
     try:
         df_asos, asos_label = get_asos_data(verbose=False)
     except Exception:
         df_asos, asos_label = None, "unavailable"
 
-    df_hist24 = (None if df_asos is not None and len(df_asos) >= ASOS_MIN_OBS
-                 else fetch_historical_24h())
+    if df_asos is None or len(df_asos) < ASOS_MIN_OBS:
+        raise RuntimeError("ASOS fit history unavailable; no other weather source is used.")
+    df_hist24 = None
 
     res = compute(df_asos, asos_label, df_hist24, curr, df_fore,
                   obs_high=curr.pop("_asos_today_high_f", None))

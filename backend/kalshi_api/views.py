@@ -7,10 +7,11 @@ from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_GET, require_POST
 
 from .algorithm import get_full_state
+from .autotrader import get_status as autotrader_status
 from .client import KalshiClientError, get_miami_temperature_payload
 from .forecast import trigger_refresh, MODELS
 from .price_tracker import record_price, nws_round_temp_f
-from .paper import PaperTradeError, get_state, parse_order, place_order, reset_account
+from .paper import PaperTradeError, get_state, parse_order, place_order, reset_account, set_auto_enabled
 from .sheets_history import get_recent_snapshots, get_recent_trades
 from .stream import stream_events
 from .temp_monitor import refresh_temp_now
@@ -239,69 +240,28 @@ def algorithm_state(request):
     return JsonResponse(state)
 
 
+@require_GET
+def autotrader_state(_request):
+    """Paper account, positions, trades, bot cycles and schedule status."""
+    return JsonResponse({**get_state(), "bot": autotrader_status()})
+
+
 @csrf_exempt
 @require_POST
-def algorithm_trade(request):
-    """
-    Execute one trading cycle: buy NO on the current bracket (if the forecast
-    is close enough to its cap) and every live bracket below it.
-
-    Body (JSON, optional):
-      { "dollars_cents": 1000, "enabled_models": ["accuweather_1h", ...] }
-    """
+def autotrader_toggle(request):
     try:
         body = json.loads(request.body.decode()) if request.body else {}
     except json.JSONDecodeError:
         body = {}
+    set_auto_enabled(bool(body.get("enabled")))
+    return JsonResponse({**get_state(), "bot": autotrader_status()})
 
-    trade_dollars_cents = int(body.get("dollars_cents", 1000))
-    enabled_models = _parse_enabled_models(
-        ",".join(body["enabled_models"]) if isinstance(body.get("enabled_models"), list) else body.get("enabled_models")
-    )
 
-    try:
-        payload = get_miami_temperature_payload(include_orderbook=False)
-    except KalshiClientError as exc:
-        return JsonResponse({"error": str(exc)}, status=502)
-
-    for m in payload["markets"]:
-        record_price(m["ticker"], m.get("yes_bid_cents"), m.get("yes_ask_cents"))
-
-    paper = get_state()
-    state = get_full_state(payload["markets"], paper, enabled_models=enabled_models)
-    rec   = state["recommendation"]
-
-    if rec["status"] != "ready":
-        return JsonResponse({"message": rec["reason"], "trades": [], "state": paper})
-
-    trades = []
-
-    def _place(side_label, trade_info):
-        nonlocal paper
-        if not trade_info or not trade_info.get("price_cents"):
-            return
-        try:
-            result = place_order(parse_order(json.dumps({
-                "action":        "buy",
-                "side":          trade_info["side"],
-                "market_ticker": trade_info["ticker"],
-                "market_label":  trade_info.get("label", ""),
-                "price_cents":   trade_info["price_cents"],
-                "dollars_cents": trade_dollars_cents,
-            }).encode()))
-            trades.append({"action": side_label, "trade": result["trade"]})
-            paper = result["state"]
-        except PaperTradeError as exc:
-            trades.append({"action": side_label, "error": str(exc)})
-
-    for leg in rec.get("no_trades", []):
-        _place("buy NO", leg)
-
-    return JsonResponse({
-        "trades":         trades,
-        "recommendation": rec,
-        "state":          paper,
-    })
+@csrf_exempt
+@require_POST
+def autotrader_reset(_request):
+    reset_account()
+    return JsonResponse({**get_state(), "bot": autotrader_status()})
 
 
 @require_GET

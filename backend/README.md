@@ -18,6 +18,9 @@ GET /api/kalshi/miami-temperature/stream/
 GET /api/kalshi/paper/state/
 POST /api/kalshi/paper/order/
 POST /api/kalshi/paper/reset/
+GET  /api/kalshi/autotrader/state/    (paper account, positions, trades, bot cycles, schedule)
+POST /api/kalshi/autotrader/toggle/   {"enabled": true|false}
+POST /api/kalshi/autotrader/reset/    (restore $10,000, clear positions/trades/bot log)
 ```
 
 ## Kalshi WebSocket credentials
@@ -37,3 +40,11 @@ CRON_REFRESH_SECRET=choose-a-long-random-string
 ```
 
 Do not put Kalshi credentials in the frontend.
+
+## Paper-trading bot
+
+Started with the other background tasks (`RUN_BACKGROUND_TASKS`, single worker). Every 15 minutes
+from 12:30 PM to 3:30 PM ET it buys 100 contracts of YES on the highest-probability bucket and
+100 contracts of NO on each live bucket the model rates below 5% (`kalshi_api/algorithm.py`,
+`kalshi_api/autotrader.py`). It never sells; positions settle from Kalshi's resolved result.
+Starting balance is $10,000.
