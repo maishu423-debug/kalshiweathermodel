@@ -18,14 +18,21 @@ If none of these are configured, both public functions fail gracefully
 import json
 import os
 import threading
+import time
 from datetime import datetime, timezone
 
 HEADER = ["timestamp", "current_temp_f", "model_forecast_f"]
 TRADES_WORKSHEET_TITLE = "Trades"
+# One row per order. A buy row is written as "open" and updated in place when its market settles:
+# realized_pl_cents (profit / loss), status (won / lost) and payout_cents are filled in then.
+# The first nine columns are the original layout, so rows written before the extra columns existed stay valid.
 TRADES_HEADER = [
     "timestamp", "market_ticker", "market_label", "action", "side",
     "price_cents", "contracts", "cash_delta_cents", "realized_pl_cents",
+    "status", "payout_cents", "model_prob", "kalshi_prob", "balance_after_cents",
 ]
+_COL_PL, _COL_STATUS, _COL_PAYOUT = 9, 10, 11   # 1-based sheet columns updated at settlement
+_READ_CACHE_SEC = 10
 
 _client_lock = threading.Lock()
 _worksheet = None
@@ -34,6 +41,7 @@ _init_failed = False
 _trades_client_lock = threading.Lock()
 _trades_worksheet = None
 _trades_init_failed = False
+_trades_rows_cache = None   # (monotonic_time, rows) — keeps the 5s UI poll from exhausting the Sheets read quota
 
 
 def _open_sheet(sheet_id):
@@ -115,8 +123,14 @@ def _build_trades_worksheet():
     except gspread.exceptions.WorksheetNotFound:
         worksheet = sheet.add_worksheet(title=TRADES_WORKSHEET_TITLE, rows=1000, cols=len(TRADES_HEADER))
 
-    if not worksheet.get_all_values():
+    existing = worksheet.get_all_values()
+    if not existing:
         worksheet.append_row(TRADES_HEADER)
+    elif existing[0] != TRADES_HEADER:
+        # Older sheet with the 9-column layout: extend the header row, leave the data rows untouched.
+        if worksheet.col_count < len(TRADES_HEADER):
+            worksheet.resize(cols=len(TRADES_HEADER))
+        worksheet.update(values=[TRADES_HEADER], range_name="A1")
 
     return worksheet
 
@@ -196,40 +210,90 @@ def get_recent_snapshots(limit=100):
     ]
 
 
+def _invalidate_trades_cache():
+    global _trades_rows_cache
+    _trades_rows_cache = None
+
+
 def append_trade(
     market_ticker, market_label, action, side,
     price_cents, contracts, cash_delta_cents, realized_pl_cents,
+    status="open", payout_cents=None, model_prob=None, kalshi_prob=None, balance_after_cents=None,
 ):
     """Append one trade-history row. No-ops if Sheets isn't configured."""
     worksheet = _get_trades_worksheet()
     if worksheet is None:
         return
 
+    def blank(value):
+        return "" if value is None else value
+
     try:
         timestamp = datetime.now(timezone.utc).isoformat()
         worksheet.append_row([
             timestamp, market_ticker, market_label, action, side,
-            price_cents, contracts, cash_delta_cents, realized_pl_cents,
+            price_cents, contracts, cash_delta_cents, blank(realized_pl_cents),
+            status, blank(payout_cents), blank(model_prob), blank(kalshi_prob), blank(balance_after_cents),
         ])
+        _invalidate_trades_cache()
     except Exception as exc:
         print(f"[sheets_history] failed to append trade ({exc})")
+
+
+def settle_trades(market_ticker, side, won):
+    """Fill in profit/loss on every still-open buy row of (market_ticker, side) once Kalshi has resolved the
+    market: a winning contract pays 100¢, a losing one 0¢. Returns the number of rows updated."""
+    worksheet = _get_trades_worksheet()
+    if worksheet is None:
+        return 0
+
+    try:
+        rows = worksheet.get_all_values()
+        updates = []
+        for index, row in enumerate(rows[1:], start=2):   # sheet rows are 1-based; row 1 is the header
+            if len(row) < 7 or row[1] != market_ticker or row[4] != side or row[3] != "buy":
+                continue
+            if len(row) > _COL_STATUS - 1 and row[_COL_STATUS - 1] not in ("", "open"):
+                continue   # already settled
+            contracts = float(row[6])
+            cost_cents = -int(float(row[7]))             # cash_delta_cents of a buy is negative
+            payout = int(round(contracts * 100)) if won else 0
+            updates.append({
+                "range": f"I{index}:K{index}",
+                "values": [[payout - cost_cents, "won" if won else "lost", payout]],
+            })
+        if updates:
+            worksheet.batch_update(updates)
+            _invalidate_trades_cache()
+        return len(updates)
+    except Exception as exc:
+        print(f"[sheets_history] failed to settle trades for {market_ticker} {side} ({exc})")
+        return 0
 
 
 def get_recent_trades(limit=100):
     """Return up to `limit` most recent trades, newest first, as dicts shaped
     like {"timestamp", "market_ticker", "market_label", "action", "side",
-    "price_cents", "contracts", "cash_delta_cents", "realized_pl_cents"}.
+    "price_cents", "contracts", "cash_delta_cents", "realized_pl_cents",
+    "status", "payout_cents", "model_prob", "kalshi_prob", "balance_after_cents"}.
     Returns [] if Sheets isn't configured or the read fails.
     """
+    global _trades_rows_cache
+
     worksheet = _get_trades_worksheet()
     if worksheet is None:
         return []
 
-    try:
-        rows = worksheet.get_all_values()
-    except Exception as exc:
-        print(f"[sheets_history] failed to read trades ({exc})")
-        return []
+    cached = _trades_rows_cache
+    if cached is not None and time.monotonic() - cached[0] < _READ_CACHE_SEC:
+        rows = cached[1]
+    else:
+        try:
+            rows = worksheet.get_all_values()
+        except Exception as exc:
+            print(f"[sheets_history] failed to read trades ({exc})")
+            return []
+        _trades_rows_cache = (time.monotonic(), rows)
 
     if len(rows) <= 1:
         return []
@@ -250,17 +314,26 @@ def get_recent_trades(limit=100):
         except (TypeError, ValueError):
             return None
 
+    def _cell(row, i):
+        return row[i] if len(row) > i and row[i] != "" else None
+
     return [
         {
-            "timestamp":          row[0] if len(row) > 0 else None,
-            "market_ticker":      row[1] if len(row) > 1 else None,
-            "market_label":       row[2] if len(row) > 2 else None,
-            "action":             row[3] if len(row) > 3 else None,
-            "side":               row[4] if len(row) > 4 else None,
-            "price_cents":        _to_int(row[5])   if len(row) > 5 else None,
-            "contracts":          _to_float(row[6]) if len(row) > 6 else None,
-            "cash_delta_cents":   _to_int(row[7])   if len(row) > 7 else None,
-            "realized_pl_cents":  _to_int(row[8])   if len(row) > 8 and row[8] != "" else None,
+            "timestamp":           _cell(row, 0),
+            "market_ticker":       _cell(row, 1),
+            "market_label":        _cell(row, 2),
+            "action":              _cell(row, 3),
+            "side":                _cell(row, 4),
+            "price_cents":         _to_int(_cell(row, 5)),
+            "contracts":           _to_float(_cell(row, 6)),
+            "cash_delta_cents":    _to_int(_cell(row, 7)),
+            "realized_pl_cents":   _to_int(_cell(row, 8)),
+            # rows written before the status column existed: a buy with no result yet is open
+            "status":              _cell(row, 9) or ("open" if _cell(row, 3) == "buy" and _cell(row, 8) is None else "closed"),
+            "payout_cents":        _to_int(_cell(row, 10)),
+            "model_prob":          _to_float(_cell(row, 11)),
+            "kalshi_prob":         _to_float(_cell(row, 12)),
+            "balance_after_cents": _to_int(_cell(row, 13)),
         }
         for row in recent
     ]

@@ -598,7 +598,7 @@ def fit_temp_ou(hist_c, hist_t, hist_h, hist_u, hist_v, hist_s, hist_dp, hist_de
 
 
 def monte_carlo_temp_vectorised(T0, var_samples, s_path, p,
-                                 hour_path=None, N=N_PATHS, dt=SIM_DT):
+                                 hour_path=None, N=N_PATHS, dt=SIM_DT, return_path_max=False):
     """
     Temperature MC with path-specific weather variables (Change 4).
 
@@ -611,6 +611,7 @@ def monte_carlo_temp_vectorised(T0, var_samples, s_path, p,
     mu and sigma are computed per-path, not shared across paths.
     """
     T      = np.full(N, float(T0), dtype=np.float64)
+    run_max = T.copy()   # running per-path maximum (the daily high is a max over the path)
     N_STEPS = len(s_path) - 1
 
     # Variable samples in [0,1] fractions or mph as-is
@@ -653,8 +654,9 @@ def monte_carlo_temp_vectorised(T0, var_samples, s_path, p,
 
         Z = np.random.randn(N)
         T = T + lam*(mu_vec - T)*dt + sig_vec*math.sqrt(dt)*Z
+        np.maximum(run_max, T, out=run_max)
 
-    return T
+    return (T, run_max) if return_path_max else T
 
 # ══════════════════════════════════════════════════════════════ COMPUTE
 
@@ -784,18 +786,23 @@ def compute(df_asos, asos_label, df_hist24, curr, df_fore, obs_high=None):
     hour_path = np.array([ts.hour + ts.minute / 60.0 for ts in sub_ts])
 
     # ── Step E: Temperature MC with per-path covariates (Change 4) ────────
-    samples = monte_carlo_temp_vectorised(
+    samples, path_max = monte_carlo_temp_vectorised(
         T0, var_samples, s_path, temp_params,
-        hour_path=hour_path, N=N_PATHS, dt=SIM_DT
+        hour_path=hour_path, N=N_PATHS, dt=SIM_DT, return_path_max=True
     )
 
     # Hard lower bound: daily high can never fall below what has already been observed.
     floor    = max(obs_high, T0) if obs_high is not None else T0
     samples  = np.maximum(samples, floor)
+    path_max = np.maximum(path_max, floor)
 
     rounded      = np.floor(samples + 0.5).astype(int)
     unique, cnts = np.unique(rounded, return_counts=True)
     probs        = cnts / float(N_PATHS)
+
+    # PDF of the daily high implied by this model: max(observed high, running max of each simulated path).
+    high_unique, high_cnts = np.unique(np.floor(path_max + 0.5).astype(int), return_counts=True)
+    high_probs = high_cnts / float(N_PATHS)
 
     # Forecast time label (AccuWeather horizon)
     # (fore_time already set in waypoint loop above)
@@ -844,6 +851,7 @@ def compute(df_asos, asos_label, df_hist24, curr, df_fore, obs_high=None):
         p10=float(np.percentile(samples,10)), p25=float(np.percentile(samples,25)),
         p75=float(np.percentile(samples,75)), p90=float(np.percentile(samples,90)),
         mode=int(unique[np.argmax(probs)]),
+        high_temps=high_unique, high_probs=high_probs, high_mean=float(path_max.mean()),
         fetched_at=datetime.now(),
     )
 
@@ -1047,6 +1055,9 @@ def run_once_json():
         "p90":        float(res["p90"]),
         "temps":      [int(t) for t in res["temps"].tolist()],
         "probs":      [float(p) for p in res["probs"].tolist()],
+        "high_temps": [int(t) for t in res["high_temps"].tolist()],
+        "high_probs": [float(p) for p in res["high_probs"].tolist()],
+        "high_mean":  float(res["high_mean"]),
         "fit_source": str(res["fit_source"]),
         "fetched_at": res["fetched_at"].isoformat(),
     }

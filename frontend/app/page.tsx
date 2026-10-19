@@ -716,9 +716,6 @@ export default function Home() {
           <ProbDistRows dist={ensemble.dist} ensemble={ensemble} />
         )}
 
-        {/* Paper trading bot */}
-        <PaperTrading books={payload.markets} recommendation={algoState?.recommendation} />
-
         {/* Momentum table */}
         {algoState?.analysis && algoState.analysis.length > 0 && (
           <div className="ev-table-wrap">
@@ -800,6 +797,9 @@ export default function Home() {
         )}
       </aside>
       </div>
+
+      {/* ── Paper trading bot + trade history (Google Sheet) ── */}
+      <PaperTrading books={payload.markets} recommendation={algoState?.recommendation} />
 
       {/* ── Market list ── */}
       <section className="layout-grid">

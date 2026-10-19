@@ -1,12 +1,15 @@
 """
 Model-driven paper-trading strategy.
 
-ENSEMBLE:     Pair same-horizon models (A1+V1, A2+V2, A3+V3) with
-              weighted averages, then combine into a daily-high PDF.
+ENSEMBLE:     Each of the 6 models (A1,V1,A2,V2,A3,V3) yields a daily-high PDF
+              (max over its simulated paths); they are mixed with
+              HORIZON_MIX[h] * in-pair weight into one daily-high PDF.
 EACH CYCLE:   Rank the live Kalshi buckets by model probability.
-              Buy YES on the single highest-probability bucket.
-              Buy NO on every live bucket whose model probability is below
-              NO_MAX_MODEL_PROB.
+              YES: only on the single highest-probability bucket, and only if
+                   our model probability is HIGHER than Kalshi's price for it.
+              NO:  on every other live bucket whose model probability is LOWER
+                   than Kalshi's price for it.
+              Otherwise no trade on that bucket.
 NO SELLING:   Contracts are held until Kalshi settles the market.
 """
 from collections import defaultdict
@@ -19,9 +22,7 @@ from .price_tracker import get_all_velocities, get_temp_snapshot, nws_round_temp
 MIAMI_UTC_OFFSET  = -4
 CUTOFF_LOCAL_HOUR = 16
 
-# Buy NO on live buckets the model gives less than this probability, as long as
-# the NO ask is still below NO_MAX_PRICE_CENTS (above that there is no upside).
-NO_MAX_MODEL_PROB = 0.05
+# Never pay more than this for a contract (above it there is no upside left).
 NO_MAX_PRICE_CENTS = 98
 YES_MAX_PRICE_CENTS = 98
 
@@ -33,6 +34,10 @@ HORIZON_WEIGHTS = {
     "2h": {"accuweather_2h": 0.5744, "var_2h": 0.4256},
     "3h": {"accuweather_3h": 0.5643, "var_3h": 0.4357},
 }
+
+# Weight of each horizon pair in the final daily-high mixture (all six models contribute).
+# Equal by default; tune from backtesting. Only the ratios matter (re-normalized).
+HORIZON_MIX = {"1h": 1.0, "2h": 1.0, "3h": 1.0}
 
 
 def hours_to_cutoff() -> float:
@@ -84,23 +89,24 @@ def _get_horizon_pdfs(results: dict) -> dict:
 
 def _get_path_high_pdf(results: dict) -> dict:
     """
-    Daily-high PDF from the longest-horizon model pair, built from the running
-    maximum of each *simulated path* (keys "high_temps"/"high_probs"), mixed
-    with the pair's weights.  Returns {} if the models don't provide it (e.g.
-    older scripts, or the 3h pair failed) so the caller can fall back.
-
-    Because the 1h/2h/3h temperatures are one correlated path, the 3h path
-    maximum already contains the 1h and 2h ones — no need to combine horizons.
+    Daily-high PDF from ALL six models, built from the running maximum of each
+    model's *simulated paths* (keys "high_temps"/"high_probs").  Each model's
+    PDF is weighted by HORIZON_MIX[horizon] * its in-pair weight from
+    HORIZON_WEIGHTS; models that errored, are disabled or lack the keys are
+    dropped and the rest re-normalized.  Returns {} if no model provides it so
+    the caller can fall back.
     """
     combined: dict[int, float] = defaultdict(float)
     total_weight = 0.0
-    for model_name, weight in HORIZON_WEIGHTS["3h"].items():
-        data = results.get(model_name, {})
-        if "error" in data or "high_temps" not in data or "high_probs" not in data:
-            continue
-        for t, p in zip(data["high_temps"], data["high_probs"]):
-            combined[int(t)] += weight * p
-        total_weight += weight
+    for horizon, pair in HORIZON_WEIGHTS.items():
+        for model_name, pair_weight in pair.items():
+            data = results.get(model_name, {})
+            if "error" in data or "high_temps" not in data or "high_probs" not in data:
+                continue
+            weight = HORIZON_MIX[horizon] * pair_weight
+            for t, p in zip(data["high_temps"], data["high_probs"]):
+                combined[int(t)] += weight * p
+            total_weight += weight
     if not combined or total_weight == 0:
         return {}
     norm = sum(combined.values())
@@ -253,17 +259,22 @@ def get_recommendation(analyses: list, results=None) -> dict:
     """
     Strategy run each cycle:
       1. Rank live brackets by model probability.
-      2. YES on the highest-probability bracket.
-      3. NO on every other live bracket with model probability < NO_MAX_MODEL_PROB.
+      2. YES on the highest-probability bracket, only if model_prob > Kalshi's
+         price for YES on that bracket (its YES ask).
+      3. NO on every other live bracket, only if model_prob < Kalshi's implied
+         YES probability on that bracket at the price we would pay for NO
+         (1 - NO ask).
+      Brackets without an edge are skipped.
 
     Return shape:
       {
         "status":     "ready" | "waiting",
         "reason":     str,
         "mean":       float | None,   # ensemble mean daily high
-        "yes_trade":  {ticker, label, side, price_cents, model_prob} | None,
-        "no_trades":  [{ticker, label, side, price_cents, model_prob}, ...],
+        "yes_trade":  {ticker, label, side, price_cents, model_prob, kalshi_prob} | None,
+        "no_trades":  [{ticker, label, side, price_cents, model_prob, kalshi_prob}, ...],
       }
+    `kalshi_prob` is Kalshi's implied probability that the bracket settles YES.
     """
     if results is None:
         results = get_forecast_cache().get("results", {})
@@ -292,38 +303,50 @@ def get_recommendation(analyses: list, results=None) -> dict:
 
     mean_high = round(sum(t * p for t, p in high_pdf.items()), 2)
 
+    def leg(bracket, side, price_cents):
+        model_p = bracket["model_prob"] or 0.0
+        kalshi_p = price_cents / 100.0 if side == "yes" else 1.0 - price_cents / 100.0
+        return {
+            "ticker":      bracket["ticker"],
+            "label":       bracket["label"],
+            "side":        side,
+            "price_cents": price_cents,
+            "model_prob":  model_p,
+            "kalshi_prob": round(kalshi_p, 4),
+        }
+
     top = max(live, key=lambda b: b["model_prob"] or 0.0)
     yes_trade = None
-    if top.get("yes_ask_cents") and top["yes_ask_cents"] <= YES_MAX_PRICE_CENTS:
-        yes_trade = {
-            "ticker":      top["ticker"],
-            "label":       top["label"],
-            "side":        "yes",
-            "price_cents": top["yes_ask_cents"],
-            "model_prob":  top["model_prob"] or 0.0,
-        }
+    yes_ask = top.get("yes_ask_cents")
+    if yes_ask and yes_ask <= YES_MAX_PRICE_CENTS:
+        candidate = leg(top, "yes", yes_ask)
+        if candidate["model_prob"] > candidate["kalshi_prob"]:
+            yes_trade = candidate
 
-    no_trades = [
-        {
-            "ticker":      b["ticker"],
-            "label":       b["label"],
-            "side":        "no",
-            "price_cents": b["no_ask_cents"],
-            "model_prob":  b["model_prob"] or 0.0,
-        }
-        for b in live
-        if b["ticker"] != top["ticker"]
-        and (b["model_prob"] or 0.0) < NO_MAX_MODEL_PROB
-        and b.get("no_ask_cents")
-        and b["no_ask_cents"] <= NO_MAX_PRICE_CENTS
-    ]
+    no_trades = []
+    for b in live:
+        no_ask = b.get("no_ask_cents")
+        if b["ticker"] == top["ticker"] or not no_ask or no_ask > NO_MAX_PRICE_CENTS:
+            continue
+        candidate = leg(b, "no", no_ask)
+        if candidate["model_prob"] < candidate["kalshi_prob"]:
+            no_trades.append(candidate)
 
     if yes_trade is None and not no_trades:
-        return waiting(f"Top bucket {top['label']} has no tradable price and no NO candidates.", mean_high)
+        top_ask = top.get("yes_ask_cents")
+        kalshi_txt = f"Kalshi {top_ask}%" if top_ask else "no Kalshi price"
+        return waiting(
+            f"No edge: top bucket {top['label']} model {(top['model_prob'] or 0.0) * 100:.0f}% vs {kalshi_txt}; "
+            f"no NO bucket priced above our model.",
+            mean_high,
+        )
 
     parts = []
     if yes_trade:
-        parts.append(f"YES {yes_trade['label']} ({yes_trade['model_prob'] * 100:.0f}%)")
+        parts.append(
+            f"YES {yes_trade['label']} (model {yes_trade['model_prob'] * 100:.0f}% "
+            f"> Kalshi {yes_trade['kalshi_prob'] * 100:.0f}%)"
+        )
     if no_trades:
         parts.append(f"NO x{len(no_trades)}: " + ", ".join(t["label"] for t in no_trades))
 

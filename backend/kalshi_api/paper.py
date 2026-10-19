@@ -151,6 +151,12 @@ def parse_order(raw_body):
     elif dollars_cents <= 0:
         raise PaperTradeError("Enter a trade amount greater than $0.")
 
+    def optional_prob(key):
+        try:
+            return round(float(payload[key]), 4) if payload.get(key) is not None else None
+        except (TypeError, ValueError):
+            return None
+
     return {
         "action": action,
         "side": side,
@@ -159,6 +165,9 @@ def parse_order(raw_body):
         "price_cents": price_cents,
         "dollars_cents": dollars_cents,
         "contracts": contracts,
+        # Recorded in the trade-history sheet only: why the bot took this trade.
+        "model_prob": optional_prob("model_prob"),
+        "kalshi_prob": optional_prob("kalshi_prob"),
     }
 
 
@@ -234,12 +243,12 @@ def place_order(order):
         realized_pl_cents=realized_pl if order["action"] == "sell" else None,
     )
 
-    _record_trade_history(trade)
+    _record_trade_history(trade, order, account.cash_cents)
 
     return {"trade": serialize_trade(trade), "state": get_state()}
 
 
-def _record_trade_history(trade):
+def _record_trade_history(trade, order, balance_after_cents):
     """Persist a trade-history row to Google Sheets. Never breaks a trade."""
     try:
         from .sheets_history import append_trade
@@ -253,9 +262,24 @@ def _record_trade_history(trade):
             contracts=decimal_to_float(trade.contracts),
             cash_delta_cents=trade.cash_delta_cents,
             realized_pl_cents=trade.realized_pl_cents,
+            status="open" if trade.action == "buy" else "closed",
+            model_prob=order.get("model_prob"),
+            kalshi_prob=order.get("kalshi_prob"),
+            balance_after_cents=balance_after_cents,
         )
     except Exception as exc:
         print(f"[paper] failed to record trade history ({exc})")
+
+
+def _record_settlements(settled):
+    """Write each settled position's profit/loss into its trade-history rows. Never breaks settlement."""
+    try:
+        from .sheets_history import settle_trades
+
+        for ticker, side, won in settled:
+            settle_trades(ticker, side, won)
+    except Exception as exc:
+        print(f"[paper] failed to record settlements in trade history ({exc})")
 
 
 def settle_positions():
@@ -281,6 +305,7 @@ def settle_positions():
             results[ticker] = market["result"]
 
     settled = 0
+    settled_for_sheet = []
     for position in open_positions:
         result = results.get(position.market_ticker)
         if result is None:
@@ -299,6 +324,8 @@ def settle_positions():
             locked_account.cash_cents += payout
             locked_account.save(update_fields=["cash_cents", "updated_at"])
             settled += 1
+            settled_for_sheet.append((locked.market_ticker, locked.side, locked.side == result))
+    _record_settlements(settled_for_sheet)
     return settled
 
 

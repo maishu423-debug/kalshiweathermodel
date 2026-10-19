@@ -3,9 +3,11 @@ Paper-trading bot.
 
 Every 15 minutes between 12:30 PM and 3:30 PM ET (inclusive, 13 cycles a day) it
 reads the latest model forecast and today's Kalshi bracket ladder, then BUYS
-CONTRACTS_PER_TRADE contracts of YES on the highest-probability bracket and of NO
-on each low-probability bracket (see algorithm.get_recommendation). It never
-sells; positions are settled from Kalshi's resolved result (paper.settle_positions).
+CONTRACTS_PER_TRADE contracts of YES on the highest-probability bracket when our
+model is more bullish than Kalshi, and of NO on each other live bracket where our
+model is less bullish than Kalshi (see algorithm.get_recommendation). It never
+sells; positions are settled from Kalshi's resolved result (paper.settle_positions),
+which also fills the profit/loss into the Google Sheet trade history.
 
 Runs as a daemon thread started from apps.py. Each cycle is keyed by its slot
 ("2026-10-17T12:30"), stored in AutoTradeRun, so a restart can't repeat a cycle.
@@ -141,6 +143,8 @@ def run_cycle(key: str):
                     "market_label":  leg["label"],
                     "price_cents":   leg["price_cents"],
                     "contracts":     CONTRACTS_PER_TRADE,
+                    "model_prob":    leg.get("model_prob"),
+                    "kalshi_prob":   leg.get("kalshi_prob"),
                 }).encode()))
                 placed += 1
             except PaperTradeError as exc:

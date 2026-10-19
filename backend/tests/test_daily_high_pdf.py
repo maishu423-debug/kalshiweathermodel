@@ -25,6 +25,33 @@ def test_path_high_pdf_mixes_3h_pair_with_weights_and_normalises():
     assert pdf[89] == pytest.approx((wa * 0.5 + wv * 1.0) / (wa + wv))
 
 
+def test_path_high_pdf_uses_all_six_models():
+    # each model is a point mass on a distinct temperature -> output weight == its effective weight
+    temps = {"accuweather_1h": 80, "var_1h": 81, "accuweather_2h": 82, "var_2h": 83,
+             "accuweather_3h": 84, "var_3h": 85}
+    results = {name: _model([t], [1.0]) for name, t in temps.items()}
+    pdf = alg._get_path_high_pdf(results)
+    assert set(pdf) == set(temps.values())
+    assert sum(pdf.values()) == pytest.approx(1.0)
+    total = sum(alg.HORIZON_MIX[h] * w for h, pair in alg.HORIZON_WEIGHTS.items() for w in pair.values())
+    for h, pair in alg.HORIZON_WEIGHTS.items():
+        for name, w in pair.items():
+            assert pdf[temps[name]] == pytest.approx(alg.HORIZON_MIX[h] * w / total)
+
+
+def test_path_high_pdf_renormalises_when_a_model_is_missing():
+    results = {
+        "accuweather_1h": _model([80], [1.0]),
+        "accuweather_3h": _model([84], [1.0]),
+        "var_2h": {"error": "boom"},
+    }
+    pdf = alg._get_path_high_pdf(results)
+    assert sum(pdf.values()) == pytest.approx(1.0)
+    w1 = alg.HORIZON_MIX["1h"] * alg.HORIZON_WEIGHTS["1h"]["accuweather_1h"]
+    w3 = alg.HORIZON_MIX["3h"] * alg.HORIZON_WEIGHTS["3h"]["accuweather_3h"]
+    assert pdf[80] == pytest.approx(w1 / (w1 + w3))
+
+
 def test_path_high_pdf_empty_when_models_lack_it_or_failed():
     assert alg._get_path_high_pdf({"accuweather_3h": {"temps": [88], "probs": [1.0]}}) == {}
     assert alg._get_path_high_pdf({"accuweather_3h": {"error": "boom"}, "var_3h": {"error": "boom"}}) == {}

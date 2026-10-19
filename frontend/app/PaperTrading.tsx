@@ -5,7 +5,32 @@ import { useCallback, useEffect, useState } from "react";
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-type Leg = { ticker: string; label: string; side: "yes" | "no"; price_cents: number; model_prob: number };
+type Leg = {
+  ticker: string;
+  label: string;
+  side: "yes" | "no";
+  price_cents: number;
+  model_prob: number;
+  kalshi_prob?: number;   // Kalshi's implied probability that the bucket settles YES
+};
+
+// One row of the Google Sheet "Trades" tab (served by /api/kalshi/algorithm/trade-history).
+type HistoryRow = {
+  timestamp: string | null;
+  market_ticker: string | null;
+  market_label: string | null;
+  action: "buy" | "sell" | null;
+  side: "yes" | "no" | null;
+  price_cents: number | null;
+  contracts: number | null;
+  cash_delta_cents: number | null;
+  realized_pl_cents: number | null;
+  status: "open" | "won" | "lost" | "closed" | null;
+  payout_cents: number | null;
+  model_prob: number | null;
+  kalshi_prob: number | null;
+  balance_after_cents: number | null;
+};
 
 export type Recommendation = {
   status: "ready" | "waiting";
@@ -139,6 +164,7 @@ export default function PaperTrading({
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [tab, setTab] = useState<"positions" | "trades" | "log">("positions");
+  const [history, setHistory] = useState<HistoryRow[] | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -151,11 +177,34 @@ export default function PaperTrading({
     }
   }, []);
 
+  const loadHistory = useCallback(async () => {
+    try {
+      const res = await fetch("/api/kalshi/algorithm/trade-history?limit=200", { cache: "no-store" });
+      if (!res.ok) return;
+      const data = (await res.json()) as { history?: HistoryRow[] };
+      setHistory(data.history ?? []);
+    } catch {
+      // silent — the panel just keeps the last rows until the next successful poll
+    }
+  }, []);
+
   useEffect(() => {
     load();
     const timer = window.setInterval(load, 5_000);
     return () => window.clearInterval(timer);
   }, [load]);
+
+  useEffect(() => {
+    loadHistory();
+    const timer = window.setInterval(loadHistory, 15_000);
+    return () => window.clearInterval(timer);
+  }, [loadHistory]);
+
+  // Re-read the sheet right away when a trade is placed or a position settles.
+  const activity = state ? `${state.trades.length}:${state.positions.filter((p) => p.settled).length}` : "";
+  useEffect(() => {
+    if (activity) loadHistory();
+  }, [activity, loadHistory]);
 
   async function post(path: string, body?: object) {
     setBusy(true);
@@ -183,9 +232,11 @@ export default function PaperTrading({
 
   if (!state) {
     return (
-      <div className="pt-wrap">
-        <h3 className="algo-section-title">Paper Trading</h3>
-        <p className={error ? "algo-error" : "algo-hint"}>{error ?? "Loading paper account…"}</p>
+      <div className="pt-layout">
+        <section className="algo-panel pt-wrap">
+          <h3 className="algo-section-title">Paper Trading</h3>
+          <p className={error ? "algo-error" : "algo-hint"}>{error ?? "Loading paper account…"}</p>
+        </section>
       </div>
     );
   }
@@ -214,8 +265,12 @@ export default function PaperTrading({
     ? [...(recommendation.yes_trade ? [recommendation.yes_trade] : []), ...(recommendation.no_trades ?? [])]
     : [];
 
+  const historyRows = history ?? [];
+  const historyNet = historyRows.reduce((sum, h) => sum + (h.realized_pl_cents ?? 0), 0);
+
   return (
-    <div className="pt-wrap">
+    <div className="pt-layout">
+    <section className="algo-panel pt-wrap">
       <div className="pt-head">
         <h3 className="algo-section-title">
           Paper Trading
@@ -243,12 +298,32 @@ export default function PaperTrading({
 
       {error && <p className="algo-error">{error}</p>}
 
-      <div className="pt-cards">
-        <div className="pt-card">
-          <span className="pt-card-label">Cash balance</span>
+      <div className="pt-hero">
+        <div className="pt-hero-tile">
+          <span className="pt-card-label">Available balance</span>
           <strong>{usd(account.cash_cents)}</strong>
-          <span className="pt-card-sub">started with {usd(account.starting_cash_cents)}</span>
+          <span className="pt-card-sub">
+            cash free to trade · started with {usd(account.starting_cash_cents)}
+          </span>
         </div>
+        <div className="pt-hero-tile pt-hero-tile--profit">
+          <span className="pt-card-label">Total profit</span>
+          <strong className="pt-pos">{signedUsd(account.total_profit_cents)}</strong>
+          <span className="pt-card-sub">{account.wins} winning position{account.wins === 1 ? "" : "s"} settled</span>
+        </div>
+        <div className="pt-hero-tile pt-hero-tile--loss">
+          <span className="pt-card-label">Total loss</span>
+          <strong className="pt-neg">{signedUsd(account.total_loss_cents)}</strong>
+          <span className="pt-card-sub">{account.losses} losing position{account.losses === 1 ? "" : "s"} settled</span>
+        </div>
+        <div className="pt-hero-tile">
+          <span className="pt-card-label">Net realized P/L</span>
+          <strong className={plClass(account.realized_pl_cents)}>{signedUsd(account.realized_pl_cents)}</strong>
+          <span className="pt-card-sub">profit + loss, settled trades only</span>
+        </div>
+      </div>
+
+      <div className="pt-cards">
         <div className="pt-card">
           <span className="pt-card-label">Portfolio value</span>
           <strong>{usd(equity)}</strong>
@@ -270,14 +345,6 @@ export default function PaperTrading({
           <span className="pt-card-label">Unrealized P/L</span>
           <strong className={plClass(unrealized)}>{signedUsd(unrealized)}</strong>
           <span className="pt-card-sub">open positions, until settled</span>
-        </div>
-        <div className="pt-card">
-          <span className="pt-card-label">Realized P/L</span>
-          <strong className={plClass(account.realized_pl_cents)}>{signedUsd(account.realized_pl_cents)}</strong>
-          <span className="pt-card-sub">
-            <span className="pt-pos">{signedUsd(account.total_profit_cents)}</span> profit ·{" "}
-            <span className="pt-neg">{signedUsd(account.total_loss_cents)}</span> loss
-          </span>
         </div>
         <div className="pt-card">
           <span className="pt-card-label">Trades placed</span>
@@ -303,7 +370,8 @@ export default function PaperTrading({
         ) : (
           plan.map((l) => (
             <span key={`${l.ticker}-${l.side}`} className={`pt-chip pt-chip--${l.side}`}>
-              {l.side.toUpperCase()} {l.label} @ {l.price_cents}¢ · {(l.model_prob * 100).toFixed(1)}%
+              {l.side.toUpperCase()} {l.label} @ {l.price_cents}¢ · model {(l.model_prob * 100).toFixed(1)}%
+              {l.kalshi_prob != null ? ` vs Kalshi ${(l.kalshi_prob * 100).toFixed(1)}%` : ""}
             </span>
           ))
         )}
@@ -399,6 +467,64 @@ export default function PaperTrading({
           )
         )}
       </div>
+    </section>
+
+    <aside className="forecast-history-panel pt-history-panel">
+      <h3 className="algo-section-title">
+        Trade History
+        <span className="algo-hint-inline"> — saved to the Google Sheet “Trades” tab</span>
+      </h3>
+      {history === null ? (
+        <p className="algo-hint">Loading trade history…</p>
+      ) : historyRows.length === 0 ? (
+        <p className="algo-hint">No trades recorded yet — each trade the bot places lands here and in the sheet.</p>
+      ) : (
+        <>
+          <p className="pt-history-sum">
+            {historyRows.length} trade{historyRows.length === 1 ? "" : "s"} · settled P/L{" "}
+            <span className={plClass(historyNet)}>{signedUsd(historyNet)}</span>
+          </p>
+          <div className="forecast-history-scroll pt-history-scroll">
+            <table className="forecast-history-table">
+              <thead>
+                <tr><th>Time (ET)</th><th>Bucket</th><th>Side</th><th>Traded</th><th>P/L</th></tr>
+              </thead>
+              <tbody>
+                {historyRows.map((h, i) => {
+                  const traded = h.cash_delta_cents != null ? Math.abs(h.cash_delta_cents) : null;
+                  return (
+                    <tr key={`${h.timestamp}-${h.market_ticker}-${h.side}-${i}`}>
+                      <td>{h.timestamp ? etTime(h.timestamp, true) : "—"}</td>
+                      <td>{h.market_label || h.market_ticker?.split("-").pop() || "—"}</td>
+                      <td>
+                        {h.side ? <span className={`pt-side pt-side--${h.side}`}>{h.side.toUpperCase()}</span> : "—"}
+                        {h.action === "sell" && <span className="pt-history-sub"> sold</span>}
+                      </td>
+                      <td>
+                        {traded != null ? usd(traded) : "—"}
+                        <span className="pt-history-sub">
+                          {h.contracts != null ? `${h.contracts.toLocaleString()} @ ${h.price_cents ?? "—"}¢` : ""}
+                        </span>
+                      </td>
+                      <td>
+                        {h.realized_pl_cents != null ? (
+                          <span className={plClass(h.realized_pl_cents)}>{signedUsd(h.realized_pl_cents)}</span>
+                        ) : (
+                          <span className="pt-history-open">open</span>
+                        )}
+                        {h.status === "won" || h.status === "lost" ? (
+                          <span className="pt-history-sub">{h.status}</span>
+                        ) : null}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+    </aside>
     </div>
   );
 }

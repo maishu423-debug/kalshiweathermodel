@@ -1446,8 +1446,80 @@ h1 {
 
 /* ── Paper trading ────────────────────────────────────────── */
 
+.pt-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 400px;
+  gap: 20px;
+  align-items: start;
+  margin-bottom: 48px;
+}
+
 .pt-wrap {
-  margin-bottom: 28px;
+  margin-bottom: 0;
+}
+
+.pt-history-panel {
+  top: 20px;
+}
+
+.pt-history-scroll {
+  max-height: 640px;
+}
+
+.pt-history-sum {
+  margin: 0 0 8px;
+  font-size: 13px;
+  color: #6f6a63;
+}
+
+.pt-history-sub {
+  display: block;
+  font-size: 11px;
+  font-weight: 600;
+  color: #89857d;
+}
+
+.pt-history-open {
+  font-size: 12px;
+  font-weight: 700;
+  color: #7a5c00;
+}
+
+/* Headline numbers: balance, total profit, total loss */
+.pt-hero {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.pt-hero-tile {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  border: 1px solid #dedbd3;
+  border-radius: 14px;
+  background: #fff;
+  padding: 16px 18px;
+}
+
+.pt-hero-tile--profit { border-color: #b7dfcc; background: #f3fbf7; }
+.pt-hero-tile--loss   { border-color: #efc4c4; background: #fff6f6; }
+
+.pt-hero-tile strong {
+  font-size: 30px;
+  line-height: 1.2;
+  color: #1f1d1a;
+}
+
+@media (max-width: 920px) {
+  .pt-layout {
+    grid-template-columns: 1fr;
+  }
+
+  .pt-history-panel {
+    position: static;
+  }
 }
 
 .pt-head {
@@ -1529,6 +1601,9 @@ h1 {
 
 .pt-pos { color: #0b6b4a; font-weight: 750; }
 .pt-neg { color: #9c1d1d; font-weight: 750; }
+/* `.pt-card strong` / `.pt-hero-tile strong` would otherwise win on specificity and paint P/L figures black */
+.pt-card strong.pt-pos, .pt-hero-tile strong.pt-pos { color: #0b6b4a; }
+.pt-card strong.pt-neg, .pt-hero-tile strong.pt-neg { color: #9c1d1d; }
 .pt-yes { color: #0b6b4a; font-weight: 750; }
 .pt-no  { color: #9c1d1d; font-weight: 750; }
 

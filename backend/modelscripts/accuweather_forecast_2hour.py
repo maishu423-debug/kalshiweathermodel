@@ -588,9 +588,13 @@ def sigma_eq(C, W, DP, p, S=0.0):
 
 
 def monte_carlo(T0, c_path, h_path, u_path, v_path, s_path, dp_path, p,
-                hour_path=None, N=N_PATHS, dt=SIM_DT):
-    """Simulate N OU paths over len(path)-1 steps of size dt hours."""
+                hour_path=None, N=N_PATHS, dt=SIM_DT, return_path_max=False):
+    """Simulate N OU paths over len(path)-1 steps of size dt hours.
+
+    With return_path_max=True also returns each path's running maximum (the daily high is a max over
+    the whole path, not a draw at one instant)."""
     T     = np.full(N, float(T0), dtype=np.float64)
+    run_max = T.copy()
     steps = len(c_path) - 1
     for i in range(steps):
         C  = float(c_path[i]);  H  = float(h_path[i])
@@ -601,7 +605,8 @@ def monte_carlo(T0, c_path, h_path, u_path, v_path, s_path, dp_path, p,
         m   = mu_eq(C, H, U, V, S, DP, p, hour=hr)
         sig = sigma_eq(C, W, DP, p, S=S)
         T   = T + p["lambda_"]*(m - T)*dt + sig*math.sqrt(dt)*np.random.randn(N)
-    return T
+        np.maximum(run_max, T, out=run_max)
+    return (T, run_max) if return_path_max else T
 
 # ══════════════════════════════════════════════════════════════ COMPUTE
 
@@ -709,16 +714,22 @@ def compute(df_asos, asos_label, df_hist24, curr, df_fore, obs_high=None):
     s_path    = solar_path(sub_ts)
     hour_path = np.array([ts.hour + ts.minute / 60.0 for ts in sub_ts])
 
-    samples      = monte_carlo(T0, c_path, h_path, u_path, v_path,
-                               s_path, dp_path, params, hour_path=hour_path)
+    samples, path_max = monte_carlo(T0, c_path, h_path, u_path, v_path,
+                                    s_path, dp_path, params, hour_path=hour_path,
+                                    return_path_max=True)
 
     # Hard lower bound: daily high can never fall below what has already been observed.
     floor    = max(obs_high, T0) if obs_high is not None else T0
     samples  = np.maximum(samples, floor)
+    path_max = np.maximum(path_max, floor)
 
     rounded      = np.floor(samples + 0.5).astype(int)
     unique, cnts = np.unique(rounded, return_counts=True)
     probs        = cnts / float(N_PATHS)
+
+    # PDF of the daily high implied by this model: max(observed high, running max of each simulated path).
+    high_unique, high_cnts = np.unique(np.floor(path_max + 0.5).astype(int), return_counts=True)
+    high_probs = high_cnts / float(N_PATHS)
 
     return dict(
         T0=T0, C0=C0, H0=H0, W0=W0, S0=S0,
@@ -735,6 +746,7 @@ def compute(df_asos, asos_label, df_hist24, curr, df_fore, obs_high=None):
         p10=float(np.percentile(samples,10)), p25=float(np.percentile(samples,25)),
         p75=float(np.percentile(samples,75)), p90=float(np.percentile(samples,90)),
         mode=int(unique[np.argmax(probs)]),
+        high_temps=high_unique, high_probs=high_probs, high_mean=float(path_max.mean()),
         fetched_at=datetime.now(),
     )
 
@@ -941,6 +953,9 @@ def run_once_json():
         "p90":        float(res["p90"]),
         "temps":      [int(t) for t in res["temps"].tolist()],
         "probs":      [float(p) for p in res["probs"].tolist()],
+        "high_temps": [int(t) for t in res["high_temps"].tolist()],
+        "high_probs": [float(p) for p in res["high_probs"].tolist()],
+        "high_mean":  float(res["high_mean"]),
         "fit_source": str(res["fit_source"]),
         "fetched_at": res["fetched_at"].isoformat(),
     }
