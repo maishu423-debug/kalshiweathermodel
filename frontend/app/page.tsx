@@ -133,64 +133,91 @@ function modelLabel(key: string) {
 
 // ── Probability Distribution Chart ───────────────────────────────────────────
 
+// Kalshi bucket semantics (integer °F): "87° to 88°" is floor 87 / cap 88 with both ends
+// inclusive, "89° or above" is floor 88 (t > floor), "80° or below" is cap 81 (t < cap).
+function bucketRange(b: MarketMomentum): { lo: number | null; hi: number | null } {
+  const lo = b.floor == null ? null : b.cap == null ? b.floor + 1 : b.floor;
+  const hi = b.cap == null ? null : b.floor == null ? b.cap - 1 : b.cap;
+  return { lo, hi };
+}
+
+function bucketLabel(lo: number | null, hi: number | null) {
+  if (lo == null && hi != null) return `P(≤ ${hi}°F)`;
+  if (hi == null && lo != null) return `P(≥ ${lo}°F)`;
+  return `P(${lo}–${hi}°F)`;
+}
+
 function ProbDistRows({
   dist,
   ensemble,
+  brackets,
 }: {
   dist: Array<{ temp: number; prob: number }>;
   ensemble: { mean?: number; mode?: number; p10?: number; p90?: number };
+  brackets: MarketMomentum[];
 }) {
   if (!dist || dist.length === 0) return null;
 
   const total = dist.reduce((sum, d) => sum + d.prob, 0) || 1;
-  const probAt = new Map(dist.map((d) => [d.temp, d.prob / total]));
-  const lo = Math.min(...dist.map((d) => d.temp));
-  const hi = Math.max(...dist.map((d) => d.temp));
+  const mass = (from: number | null, to: number | null) =>
+    dist
+      .filter((d) => (from == null || d.temp >= from) && (to == null || d.temp <= to))
+      .reduce((sum, d) => sum + d.prob, 0) / total;
 
-  // 2°F brackets aligned like Kalshi's (88–89, 90–91, ...)
-  const rows: Array<{ from: number; to: number; prob: number; atLeast: number; atMost: number }> = [];
-  let cumulative = 0;
-  for (let from = lo - (((lo % 2) + 2) % 2); from <= hi; from += 2) {
-    const prob = (probAt.get(from) ?? 0) + (probAt.get(from + 1) ?? 0);
-    rows.push({ from, to: from + 1, prob, atLeast: 1 - cumulative, atMost: cumulative + prob });
-    cumulative += prob;
-  }
+  // One row per live Kalshi bucket, coldest first, so the table always mirrors Kalshi's ladder.
+  const rows = brackets
+    .map((b) => {
+      const { lo, hi } = bucketRange(b);
+      return {
+        key: b.ticker,
+        label: bucketLabel(lo, hi),
+        dead: b.is_dead,
+        prob: mass(lo, hi),
+        atLeast: mass(lo, null),
+        atMost: mass(null, hi),
+        sortKey: lo ?? -Infinity,
+      };
+    })
+    .sort((a, b) => a.sortKey - b.sortKey);
 
-  const visible = rows.filter((r) => r.prob >= 0.001);
-  const maxProb = Math.max(...visible.map((r) => r.prob), 0.0001);
+  const maxProb = Math.max(...rows.map((r) => r.prob), 0.0001);
   const tier = (p: number) => (p >= 0.6 ? "high" : p >= 0.3 ? "mid" : "low");
 
   return (
     <div className="dist-rows-wrap">
       <h3 className="algo-section-title">
         Probability Distribution
-        <span className="algo-hint-inline"> — ensemble daily high forecast</span>
+        <span className="algo-hint-inline"> — ensemble daily high, grouped into today&apos;s Kalshi buckets</span>
       </h3>
 
-      <table className="dist-rows-table">
-        <thead>
-          <tr>
-            <th>Range</th>
-            <th>Probability</th>
-            <th></th>
-            <th>P(≥ low)</th>
-            <th>P(≤ high)</th>
-          </tr>
-        </thead>
-        <tbody>
-          {visible.map((r) => (
-            <tr key={r.from} className={`dist-row dist-row--${tier(r.prob)}`}>
-              <td className="dist-row-label">P({r.from}–{r.to}°F)</td>
-              <td className="dist-row-pct">{(r.prob * 100).toFixed(1)}%</td>
-              <td className="dist-row-bar">
-                <span style={{ width: `${(r.prob / maxProb) * 100}%` }} />
-              </td>
-              <td>{(r.atLeast * 100).toFixed(1)}%</td>
-              <td>{(r.atMost * 100).toFixed(1)}%</td>
+      {rows.length === 0 ? (
+        <p className="algo-hint">Waiting for Kalshi buckets to load.</p>
+      ) : (
+        <table className="dist-rows-table">
+          <thead>
+            <tr>
+              <th>Bucket</th>
+              <th>Probability</th>
+              <th></th>
+              <th>P(≥ low)</th>
+              <th>P(≤ high)</th>
             </tr>
-          ))}
-        </tbody>
-      </table>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.key} className={`dist-row dist-row--${tier(r.prob)} ${r.dead ? "dist-row--dead" : ""}`}>
+                <td className="dist-row-label">{r.label}</td>
+                <td className="dist-row-pct">{(r.prob * 100).toFixed(1)}%</td>
+                <td className="dist-row-bar">
+                  <span style={{ width: `${(r.prob / maxProb) * 100}%` }} />
+                </td>
+                <td>{(r.atLeast * 100).toFixed(1)}%</td>
+                <td>{(r.atMost * 100).toFixed(1)}%</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
 
       <div className="dist-legend">
         <span className="dist-stat">mode <strong>{ensemble.mode}°F</strong></span>
@@ -713,7 +740,7 @@ export default function Home() {
 
         {/* Probability distribution */}
         {ensemble?.dist && ensemble.dist.length > 0 && (
-          <ProbDistRows dist={ensemble.dist} ensemble={ensemble} />
+          <ProbDistRows dist={ensemble.dist} ensemble={ensemble} brackets={algoState?.analysis ?? []} />
         )}
 
         {/* Momentum table */}

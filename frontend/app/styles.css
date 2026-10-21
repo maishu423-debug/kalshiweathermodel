@@ -912,6 +912,14 @@ h1 {
   color: #0d7a58;
 }
 
+.dist-row--dead td {
+  opacity: 0.45;
+}
+
+.dist-row--dead .dist-row-label {
+  text-decoration: line-through;
+}
+
 .dist-legend {
   display: flex;
   gap: 20px;

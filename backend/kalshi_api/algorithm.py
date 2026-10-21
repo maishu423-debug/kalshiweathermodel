@@ -181,13 +181,25 @@ def _compute_daily_high_pdf(horizon_pdfs: dict, known_high_f: float | None,
 
 # ── Step 3: bracket probability from daily-high PDF ──────────────────────────
 
+def _in_bracket(t, floor, cap) -> bool:
+    """
+    Does integer temperature t settle a Kalshi bucket YES?
+      between (floor, cap):  floor <= t <= cap   ("87° to 88°" is floor 87, cap 88)
+      greater (floor only):  t > floor           ("89° or above" is floor 88)
+      less    (cap only):    t < cap             ("80° or below" is cap 81)
+    """
+    if floor is not None and cap is not None:
+        return float(floor) <= t <= float(cap)
+    if floor is not None:
+        return t > float(floor)
+    if cap is not None:
+        return t < float(cap)
+    return True
+
+
 def _bracket_prob(floor, cap, high_pdf: dict) -> float:
-    """P(floor <= final_daily_high < cap) using integer temperatures."""
-    return round(sum(
-        p for t, p in high_pdf.items()
-        if (floor is None or t >= float(floor))
-        and (cap   is None or t <  float(cap))
-    ), 4)
+    """P(final_daily_high settles the bucket) using integer temperatures."""
+    return round(sum(p for t, p in high_pdf.items() if _in_bracket(t, floor, cap)), 4)
 
 
 # ── Market analysis ───────────────────────────────────────────────────────────
@@ -221,8 +233,9 @@ def analyze_markets(markets: list) -> list:
         if no_ask is None and yes_bid is not None:
             no_ask = 100 - yes_bid
 
+        # The daily high only rises: a bucket is dead once the known high is above its top.
         is_dead = (
-            (cap is not None and known >= float(cap))
+            (cap is not None and known > (float(cap) if floor is not None else float(cap) - 1))
             or (yes_ask is not None and yes_ask <= 3)
         )
 
